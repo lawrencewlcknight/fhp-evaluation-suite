@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fhp-evaluation-suite"
+version = "0.1.0"
+description = "Shared, reproducible evaluation for OpenSpiel flop hold'em policies"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+  "numpy>=1.26,<2.0",
+  "open_spiel==1.6.3",
+  "scipy>=1.13,<2.0",
+  "torch>=2.7,<3.0",
+  "psutil>=5.9,<8.0",
+]
+
+[project.scripts]
+fhp-evaluate = "fhp_evaluation.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["fhp_evaluation", "fhp_evaluation.*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["slow: validation that is too expensive for the default test run"]
+
+[tool.ruff]
+line-length = 100

@@ -1,0 +1,6 @@
+# Minimal inference/evaluation runtime; no Ray or training stack is installed.
+numpy==1.26.4
+open_spiel==1.6.3
+scipy==1.13.1
+psutil==7.2.1
+# Torch CPU 2.7.0 is installed separately from the official CPU wheel index.
