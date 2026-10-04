@@ -1,5 +1,49 @@
 # Validation record
 
+## Batch Python-bootstrap correction — 4 October 2026
+
+Job `fhp-br-exp9-20261004-104050` failed during `python3 -m venv`, before
+evaluation, with an unresolved base-executable error. The source and checkpoint
+checksum checks passed, and the diagnostic upload completed. The historical log
+does not record PATH, so its precise inherited value cannot be confirmed.
+
+Both Batch runnables now export a standard Linux PATH while retaining additional
+entries. Bootstrap invokes `/usr/bin/python3 -I` explicitly, reports its version,
+executable and base executable, and identifies each setup stage and the failing
+stage/line/exit code. `main_exit.json` retains the exit code and adds the main
+stage. Runtime pins, checkpoint identity, evaluation workloads and resource
+limits are unchanged. Documentation makes cloud smoke a manual prerequisite
+before the first pilot or after setup changes; no job is launched automatically.
+
+All **79 evaluation-suite tests passed**, with UCV, VR-Deep and SD-CFR native
+integration enabled. The new 18 checks cover missing/empty/custom PATH in both
+runnables, real local venv creation with missing/empty PATH and invalid inherited
+Python environment variables, and successful/failing setup-stage sequences.
+The real venv checks substitute the local test interpreter for Debian's path;
+the package-install flow mocks external commands and performs no network installs.
+The first sandboxed suite run blocked four watchdog tests at macOS process
+inspection; rerunning with that permission passed all 79, without weakening the
+watchdog. The UCV-root launcher also passed all **12 dedicated tests**.
+
+These are local regression checks, **not Linux/GCP acceptance**. No cloud job was
+submitted during this correction. Run the documented cloud smoke with a fresh
+ID and require `SUCCEEDED` before retrying the pilot.
+
+## macOS submission preflight correction — 4 October 2026
+
+Replaced the launcher's direct Python HTTPS/token handling with the authenticated
+`gcloud storage objects list` path. Empty namespaces return a JSON list; command
+failures, occupied namespaces and malformed output are rejected. TLS verification
+is not disabled, and no system certificate configuration is changed.
+
+All **61 tests passed**, including regressions for empty/occupied namespaces,
+permission failures, malformed output, and preventing direct Python HTTPS usage.
+The complete read-only preflight also passed with the exact Python.org 3.12
+installation that produced the reported TLS error, using the user's existing
+GCP project and bucket. Read-only checks confirmed no job or uploaded objects
+for failed run `fhp-br-exp9-20261004-103058`. No uploads or job submissions were
+performed during verification.
+
 ## Experiment 9 Batch pilot — 4 October 2026
 
 After adding `exp4_ucv_exp9_br_pilot`, the full suite passed **56 tests** with

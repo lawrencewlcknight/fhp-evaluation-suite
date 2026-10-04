@@ -83,7 +83,7 @@ calls**, uploads nothing and submits nothing. The normal `submit` command below
 creates a fresh snapshot, so do not change source code between preview and submit
 if you want to submit exactly the reviewed source.
 
-## 2. Optional cloud execution smoke
+## 2. Cloud execution smoke (required before the first pilot or after setup changes)
 
 This uses the same real Experiment 9 checkpoint and the same bootstrap/upload
 path, but reduces each profile to one board/one repeat and the final comparison
@@ -101,7 +101,7 @@ No later job is automatically launched by a smoke job.
 
 ## 3. Submit the pilot
 
-If you ran the optional smoke, set a new pilot ID first:
+After the smoke succeeds, set a new pilot ID:
 
 ```bash
 export RUN_ID="fhp-br-exp9-$(date -u +%Y%m%d-%H%M%S)"
@@ -119,6 +119,37 @@ laptop after successful submission.
 The runtime uses Python 3.11.13, CPU Torch 2.7.0, OpenSpiel 1.6.3 and the pinned
 dependencies in `gcp/requirements-br-pilot.txt`. Ray and the training stack are
 not required. Resolved dependencies and Python version are saved with results.
+
+### Recovering from a local TLS preflight error
+
+The launcher now uses `gcloud` for every cloud preflight request, including
+checking whether the output prefix is unused. This avoids relying on the local
+Python installation's separate certificate store; TLS verification remains
+enabled. Authentication, network and malformed-listing errors still stop submission.
+
+If an earlier version failed with Python's `CERTIFICATE_VERIFY_FAILED` before
+source upload, it did not submit a Batch job. Keep the local preparation files
+for diagnosis and retry with a **new `RUN_ID`**, because existing local output
+directories are deliberately not overwritten. No system certificate changes or
+TLS-verification bypass are needed for this corrected launcher.
+
+### Recovering from the VM Python setup failure
+
+Run `fhp-br-exp9-20261004-104050` failed before evaluation when Python could
+not determine its base executable while creating the bootstrap virtual environment.
+The corrected scripts export a standard Linux `PATH` (retaining existing extra
+entries) and invoke `/usr/bin/python3 -I` explicitly for bootstrap. The pinned
+Python 3.11.13 evaluation runtime and all experiment settings remain unchanged.
+
+`bootstrap.log` now records named setup stages, the resolved Python executable,
+base executable and version, and the stage/line/exit code on failure. No complete
+environment dump or credentials are logged. `main_exit.json` also identifies the
+main stage reached. Both main and final-upload runnables initialise their PATH.
+
+Use a **new `RUN_ID`** and run the cloud smoke above first; do not reuse the failed
+job ID or overwrite its diagnostics. Local tests do not replace verification on
+the actual Batch image. A successful cloud smoke is a manual prerequisite, not an
+automatic launcher-enforced gate. No pilot is submitted automatically.
 
 ## 4. Monitor
 

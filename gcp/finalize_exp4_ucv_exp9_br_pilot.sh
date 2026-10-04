@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
 OUTPUT=/workspace/fhp-br-exp9/output
 mkdir -p "$OUTPUT"
 exec 9>/workspace/fhp-br-exp9/upload.lock

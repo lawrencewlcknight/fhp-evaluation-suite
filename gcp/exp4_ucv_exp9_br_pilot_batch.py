@@ -11,8 +11,6 @@ from pathlib import Path
 import re
 import subprocess
 import tarfile
-import urllib.parse
-import urllib.request
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -135,19 +133,18 @@ def cloud_preflight(args):
     size = metadata.get("size", metadata.get("sizeBytes"))
     if size is not None and not 0 < int(size) <= 256 * 1024**2:
         raise ValueError("Unexpected checkpoint size; refusing a large or empty download")
-    # The public JSON API supports a server-side prefix and returns an empty list
-    # for an unused namespace, distinct from authorization/network failures.
-    # Never print, persist or package the short-lived token.
-    token = read("gcloud", "auth", "print-access-token").strip()
-    query = urllib.parse.urlencode(dict(prefix=f"{args.run_id}/", maxResults=1))
-    url = f"https://storage.googleapis.com/storage/v1/b/{args.bucket[5:]}/o?{query}"
-    request = urllib.request.Request(url, headers={"Authorization": "Bearer " + token})
-    with urllib.request.urlopen(request, timeout=30) as response:
-        objects = json.load(response)
-    if objects.get("items") or objects.get("prefixes"):
+    # Use gcloud's authenticated, TLS-verified transport for every cloud check.
+    # Python.org macOS runtimes can lack a usable default certificate store even
+    # when gcloud works. Do not extract tokens or disable certificate verification.
+    # Unlike `storage ls`/`--stat`, objects list returns [] for no matches. Any
+    # command failure still propagates; it must never be mistaken for emptiness.
+    objects = json.loads(read("gcloud", "storage", "objects", "list",
+                             f"{args.bucket}/{args.run_id}/**",
+                             "--exhaustive", "--limit=1", "--format=json"))
+    if not isinstance(objects, list):
+        raise ValueError("Unexpected object listing; refusing submission")
+    if objects:
         raise ValueError("Output namespace already exists; use a new RUN_ID")
-    if objects.get("nextPageToken"):
-        raise ValueError("Namespace check was incomplete; refusing submission")
     jobs = json.loads(read("gcloud", "batch", "jobs", "list", "--project", args.project,
                           "--location", args.region, "--filter", f"name:{args.run_id}", "--format=json"))
     if jobs:

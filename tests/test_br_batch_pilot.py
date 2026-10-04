@@ -1,14 +1,12 @@
 import argparse
 import hashlib
 import importlib.util
-import io
 import json
 from pathlib import Path
 import subprocess
 import sys
 import tarfile
 from types import SimpleNamespace
-import urllib.error
 
 import pytest
 
@@ -104,18 +102,17 @@ def test_cloud_preflight_fails_closed(native, monkeypatch, occupied, denied):
         calls.append(command)
         if command[:4] == ("gcloud", "storage", "objects", "describe"):
             return SimpleNamespace(stdout=json.dumps(dict(size=1000)))
-        if command[:3] == ("gcloud", "auth", "print-access-token"):
-            return SimpleNamespace(stdout="test-token")
+        if command[:4] == ("gcloud", "storage", "objects", "list"):
+            assert command[4] == "gs://example-bucket/fhp-br-exp9-test/**"
+            assert "--exhaustive" in command and "--limit=1" in command
+            assert "--format=json" in command
+            if denied:
+                raise subprocess.CalledProcessError(1, command, stderr="403 denied")
+            return SimpleNamespace(stdout=json.dumps([dict(name="existing")] if occupied else []))
         return SimpleNamespace(stdout="[]")
-    def fake_open(request, timeout):
-        assert "prefix=fhp-br-exp9-test%2F" in request.full_url
-        if denied:
-            raise urllib.error.HTTPError(request.full_url, 403, "denied", {}, None)
-        return io.BytesIO(json.dumps(dict(items=[dict(name="existing")] if occupied else [])).encode())
     monkeypatch.setattr(batch.subprocess, "run", fake_run)
-    monkeypatch.setattr(batch.urllib.request, "urlopen", fake_open)
     if denied:
-        with pytest.raises(urllib.error.HTTPError):
+        with pytest.raises(subprocess.CalledProcessError):
             batch.cloud_preflight(args(native))
     elif occupied:
         with pytest.raises(ValueError, match="namespace"):
@@ -123,6 +120,30 @@ def test_cloud_preflight_fails_closed(native, monkeypatch, occupied, denied):
     else:
         batch.cloud_preflight(args(native))
     assert not any("submit" in c or "cp" in c for c in calls)
+    assert not any("print-access-token" in c for c in calls)
+
+
+@pytest.mark.parametrize("response", ["", "null", "{}", "not-json"])
+def test_namespace_check_rejects_invalid_output(native, monkeypatch, response):
+    def fake_run(command, **_):
+        if command[:4] == ("gcloud", "storage", "objects", "list"):
+            return SimpleNamespace(stdout=response)
+        if command[:4] == ("gcloud", "storage", "objects", "describe"):
+            return SimpleNamespace(stdout='{"size":1000}')
+        return SimpleNamespace(stdout="[]")
+    monkeypatch.setattr(batch.subprocess, "run", fake_run)
+    with pytest.raises(ValueError):
+        batch.cloud_preflight(args(native))
+
+
+def test_namespace_check_does_not_use_python_https(native, monkeypatch):
+    import urllib.request
+    def forbidden(*_, **__):
+        pytest.fail("Preflight bypassed gcloud's TLS/authentication transport")
+    monkeypatch.setattr(urllib.request, "urlopen", forbidden)
+    monkeypatch.setattr(batch.subprocess, "run", lambda command, **_: SimpleNamespace(
+        stdout='{"size":1000}' if command[:4] == ("gcloud", "storage", "objects", "describe") else "[]"))
+    batch.cloud_preflight(args(native))
 
 
 def fake_worker(seen, statuses=None):
