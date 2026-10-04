@@ -62,3 +62,12 @@ hand.
 
 The dated acceptance results and differential-loader checks are recorded in
 [`VALIDATION.md`](VALIDATION.md).
+
+## Frozen-policy cohort runner
+
+`fhp_evaluation.cohort` and `cohort_report` support native policy adapters,
+UCV-compatible retrospective duplicate schedules, bounded process workers,
+checksum-guarded task recovery, timing forecasts, and seed-level reports.
+The VR-Deep repository's `retrospective_exp1_exp2_exp3_evaluation` defines its
+frozen sources and GCP launcher. Main comparisons finish before its independently
+cost-gated nine-final-policy LBR stage; no policy training occurs in this suite.
