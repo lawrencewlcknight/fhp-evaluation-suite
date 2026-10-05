@@ -87,7 +87,37 @@ def compare(game, target, spec, *, progress_path=None):
     rng = np.random.default_rng(spec["seed"])
     values = {"lbr": [], "full_flop": []}
     seats = {"lbr": [[], []], "full_flop": [[], []]}
-    for index in range(spec["deals"]):
+    start = 0
+    progress_identity = {
+        "schema_version": 1,
+        "evaluation_seed": int(spec["seed"]),
+        "search_seed": int(spec["search_seed"]),
+        "preflop_rollouts": int(spec["rollouts"]),
+        "requested_pairs": int(spec["deals"]),
+    }
+    if progress_path is not None and spec.get("resume_partial") and Path(progress_path).is_file():
+        previous = json.loads(Path(progress_path).read_text())
+        if previous.get("progress_identity") != progress_identity:
+            raise ValueError("Partial comparison identity does not match this request")
+        start = int(previous.get("completed_pairs", -1))
+        previous_values = previous.get("pair_payoffs_mbb")
+        previous_seats = previous.get("seat_payoffs_chips")
+        if not 0 <= start <= spec["deals"]:
+            raise ValueError("Invalid completed-pair count in partial comparison")
+        if (set(previous_values or ()) != set(values)
+                or set(previous_seats or ()) != set(seats)
+                or any(len(previous_values[label]) != start for label in values)
+                or any(len(previous_seats[label]) != 2
+                       or any(len(row) != start for row in previous_seats[label])
+                       for label in seats)):
+            raise ValueError("Malformed partial comparison payload")
+        values = {label: list(previous_values[label]) for label in values}
+        seats = {label: [list(row) for row in previous_seats[label]] for label in seats}
+        for _ in range(start):
+            rng.integers(0, 2**63 - 1)
+            rng.integers(0, 2**63 - 1)
+        event("comparison_resumed", completed=start, total=spec["deals"])
+    for index in range(start, spec["deals"]):
         chance, action = (int(rng.integers(0, 2**63 - 1)) for _ in range(2))
         for label, responder in (("lbr", baseline), ("full_flop", improved)):
             if len(baseline._action_cache) >= 2048:
@@ -103,6 +133,7 @@ def compare(game, target, spec, *, progress_path=None):
             write_json(progress_path, dict(complete=False, completed_pairs=index + 1,
                                            requested_pairs=spec["deals"], pair_payoffs_mbb=values,
                                            seat_payoffs_chips=seats, evaluation_seed=spec["seed"],
+                                           progress_identity=progress_identity,
                                            scope="partial_payoff_diagnostics_not_a_final_estimate"))
         event("deal_pair_completed", completed=index + 1, total=spec["deals"])
     return dict(experiment="exp3_br_checkpoint_comparison", metric="exploitability_lower_bound_estimate",

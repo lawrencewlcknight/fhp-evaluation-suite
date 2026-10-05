@@ -156,6 +156,27 @@ def test_paired_comparison_is_explicitly_not_exact(game, tmp_path):
     assert "ci95_low" not in progress
 
 
+def test_paired_comparison_resumes_exact_completed_prefix(game, tmp_path, monkeypatch):
+    target = PolicyAdapter(FixedPolicy(game, "uniform"))
+    partial = tmp_path / "partial.json"
+    spec = dict(deals=2, seed=2401, search_seed=91, rollouts=2, resume_partial=True)
+    first = compare(game, target, spec, progress_path=partial)
+    monkeypatch.setattr("fhp_evaluation.best_response.worker.play_hand",
+                        lambda *_, **__: pytest.fail("completed pairs were replayed"))
+    second = compare(game, target, spec, progress_path=partial)
+    assert second["pair_payoffs_mbb"] == first["pair_payoffs_mbb"]
+
+
+def test_paired_comparison_refuses_partial_from_another_stream(game, tmp_path):
+    target = PolicyAdapter(FixedPolicy(game, "uniform"))
+    partial = tmp_path / "partial.json"
+    compare(game, target, dict(deals=1, seed=24, search_seed=91, rollouts=2,
+                               resume_partial=True), progress_path=partial)
+    with pytest.raises(ValueError, match="identity"):
+        compare(game, target, dict(deals=1, seed=25, search_seed=91, rollouts=2,
+                                   resume_partial=True), progress_path=partial)
+
+
 @pytest.mark.parametrize("kind,code,limit,seconds", [
     ("time_limit", "import time; time.sleep(10)", 2048, .3),
     ("memory_limit", "import time; x=bytearray(100*1024**2); time.sleep(10)", 40, 10),

@@ -202,3 +202,102 @@ RSS is polled every 0.1 seconds, not enforced as a hard allocation ceiling. A VM
 or process killed abruptly may lack its final diagnostics; inspect periodic
 uploads and Batch/Cloud Logging events as well. Upload errors are not silently
 reported as successful job completion.
+
+## Production follow-up — `exp5_ucv_exp9_br_production_3seed`
+
+Experiment 5 freezes the 24-hour policies from Experiment 9 training seeds 0,
+1 and 2. For each policy it evaluates 2,000 fresh duplicate pairs (4 shards of
+500), with both seats per pair, 4,096 preflop rollouts and the pilot-selected two
+CPU threads. There are 6,000 pairs/12,000 hands in total. Corresponding shards
+across training seeds use identical deal/action streams; LBR and exact-flop use
+the same stream within every shard. The four streams are distinct from the pilot.
+
+The worker job has 12 parallel `n2-standard-2` tasks, a four-hour task ceiling,
+standard provisioning and no automatic retries. Each pair is atomically saved;
+the active shard is uploaded every minute. A restored shard resumes only when
+its protocol, source bundle, checkpoint hash and random stream identity match.
+
+The separately cost-gated aggregate job can only be submitted after all 12
+`SUCCESS.json` markers exist. Its primary estimate is the unweighted mean of the
+three seed-level paired exact-flop-minus-LBR differences, with a Student-*t*
+interval over training seeds. The pooled pair-level interval is secondary and
+conditional on the frozen policies. Both response scores remain whole-game
+exploitability lower bounds because preflop is still LBR.
+
+### 1. Prepare an immutable request (no cloud calls)
+
+```bash
+cd /Users/lawrenceknight/Documents/deep_cfr_v3/fhp-evaluation-suite
+export FHP_NATIVE_REPO=/Users/lawrenceknight/Documents/deep_cfr_v3/fhp_ucv_escher/fhp-ucv-escher-experiments
+export RUN_ID="fhp-br-exp9-prod-$(date -u +%Y%m%d-%H%M%S)"
+
+python3 gcp/exp5_ucv_exp9_br_production_batch.py prepare \
+  --native-repo "$FHP_NATIVE_REPO"
+```
+
+Review `outputs/batch/$RUN_ID/request.json`, `workers_job.json`,
+`aggregate_job.json`, and the source manifest inside `source.tar.gz`. Preparation
+does not contact GCP. Submission verifies the exact prepared bundle hash; source
+changes require a new run ID and a new preparation.
+
+For the first infrastructure check, prepare a distinct ID with `--smoke`; repeat
+`--smoke` on both submission commands. Smoke uses two pairs per shard and eight
+rollouts and is not an estimate.
+
+### 2. Submit and monitor the workers
+
+```bash
+python3 gcp/exp5_ucv_exp9_br_production_batch.py submit-workers
+
+gcloud batch jobs describe "${RUN_ID}-workers" \
+  --project "$PROJECT_ID" --location "$REGION" --format='yaml(status)'
+```
+
+The launcher verifies all three source checkpoints, refuses an occupied output
+prefix/job name, then uploads the immutable request with generation
+preconditions. The fixed checkpoint SHA-256 values are checked before loading.
+
+If a task is interrupted, its last uploaded `partial.json` is retained. Do not
+edit it. After diagnosing the failure, explicitly submit a recovery attempt with
+a unique tag (completed shards validate their identity and exit; incomplete
+shards continue at their next unsaved pair):
+
+```bash
+python3 gcp/exp5_ucv_exp9_br_production_batch.py submit-recovery \
+  --recovery-tag r1
+```
+
+Recovery requires the existing namespace and refuses an occupied recovery job
+name. It reuses the reviewed local request/bundle and does not overwrite cloud
+inputs. Every task fails closed if restored metadata differs from its immutable
+source/checkpoint/protocol identity.
+
+### 3. Submit aggregation only after all workers succeed
+
+```bash
+python3 gcp/exp5_ucv_exp9_br_production_batch.py submit-aggregate
+
+gcloud batch jobs describe "${RUN_ID}-aggregate" \
+  --project "$PROJECT_ID" --location "$REGION" --format='yaml(status)'
+```
+
+Preflight requires exactly 12 worker success markers and an empty analysis
+prefix. Important outputs are `analysis/aggregate_summary.json`,
+`analysis/seed_summary.csv`, `analysis/report.md`, and `analysis/SUCCESS.json`.
+
+### 4. Download final analysis and raw shards
+
+```bash
+FHP_BUCKET_ROOT="gs://${BUCKET#gs://}"
+FHP_BUCKET_ROOT="${FHP_BUCKET_ROOT%/}"
+mkdir -p "cloud_outputs/$RUN_ID"
+gcloud storage rsync --recursive \
+  "$FHP_BUCKET_ROOT/$RUN_ID/analysis" \
+  "cloud_outputs/$RUN_ID/analysis"
+gcloud storage rsync --recursive \
+  "$FHP_BUCKET_ROOT/$RUN_ID/workers" \
+  "cloud_outputs/$RUN_ID/workers"
+```
+
+Raw per-pair response scores and separate seat payoffs remain in every shard's
+`result.json`; the aggregate does not discard or rewrite them.

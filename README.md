@@ -27,6 +27,10 @@ bounded CPU batches, resource watchdogs and independent validation are included.
 Full preflop integration is not part of this first stage. A bounded,
 single-VM Experiment 9 pilot is available: see
 [GCP Batch instructions](docs/gcp_batch_experiments.md).
+The follow-on `exp5_ucv_exp9_br_production_3seed` freezes all three 24-hour
+Experiment 9 checkpoints and evaluates 2,000 fresh duplicate pairs per training
+seed in twelve resumable shards. Its primary interval treats the three training
+seeds—not the 6,000 deal pairs—as the independent policy-level observations.
 
 ## Install and run
 

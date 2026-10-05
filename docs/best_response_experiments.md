@@ -173,9 +173,11 @@ this collision; do not load both families directly into one Python process.
 
 No cloud jobs are submitted by these commands. They can run on an existing CPU
 VM with the same environment and staged native repositories/checkpoints.
-[The separate GCP Batch launcher](gcp_batch_experiments.md) implements a bounded
-Experiment 9 seed-0 pilot (`exp4_ucv_exp9_br_pilot`). Distributed full-game
-aggregation remains subsequent work.
+[The separate GCP Batch launcher](gcp_batch_experiments.md) implements both the
+bounded Experiment 9 seed-0 pilot (`exp4_ucv_exp9_br_pilot`) and its frozen,
+three-seed production follow-up (`exp5_ucv_exp9_br_production_3seed`). The latter
+uses twelve deterministic/resumable shards and reports policy-level uncertainty
+over training seeds separately from conditional pair-level Monte Carlo precision.
 
 ## Design references
 
