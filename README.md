@@ -9,6 +9,18 @@ This repository is the single evaluation implementation shared by
 - a poker-specific Local Best Response (LBR) lower-bound probe;
 - collision-free checkpoint loading for all three policy formats.
 
+## Strategic-position audit
+
+The `strategic-library`, `strategic-spec`, `strategic-validate` and `strategic-run`
+commands implement a frozen, range-aware final-round diagnostic. They separate
+provable decision errors, one-decision EV gaps with fixed continuation, and
+remaining-round best-response gaps. A 96-board development/assessment library,
+fixed reference-position sample, portable native-policy caches, resumable bounded
+workers and HTML/SVG/JSON reports are included. A generator pins the six Exp9/10
+24-hour policies and the fixed eight-opponent panel. See
+[the strategic-audit guide](docs/strategic_audit.md). This is not whole-game
+exploitability and does not modify or retrain policies.
+
 The released DeepPDCFR code contains `LooseAggressive=(-100,-300)`. That
 ordering makes its middle (call) branch unreachable. The suite treats it as a
 transposition error and uses `(-300,-100)`. `StrengthBands` rejects reversed

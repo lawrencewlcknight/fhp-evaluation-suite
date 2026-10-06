@@ -58,11 +58,17 @@ def _parser() -> argparse.ArgumentParser:
     lbr.add_argument("--output")
     from .best_response.commands import register
     register(subparsers)
+    from .strategic_audit.commands import register as register_strategic
+    register_strategic(subparsers)
     return parser
 
 
 def main(argv=None) -> None:
     args = _parser().parse_args(argv)
+    if args.command.startswith("strategic-"):
+        from .strategic_audit.commands import dispatch
+        dispatch(args)
+        return
     if args.command.startswith("br-"):
         from .best_response.commands import dispatch
         dispatch(args)
