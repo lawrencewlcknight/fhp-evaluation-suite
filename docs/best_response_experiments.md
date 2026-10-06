@@ -177,7 +177,11 @@ VM with the same environment and staged native repositories/checkpoints.
 bounded Experiment 9 seed-0 pilot (`exp4_ucv_exp9_br_pilot`) and its frozen,
 three-seed production follow-up (`exp5_ucv_exp9_br_production_3seed`). The latter
 uses twelve deterministic/resumable shards and reports policy-level uncertainty
-over training seeds separately from conditional pair-level Monte Carlo precision.
+over training seeds separately from conditional deal-level Monte Carlo precision.
+Matching deals are averaged across the three frozen models before estimating
+the latter interval, preserving common-random-number covariance. Both intervals
+are conditional, not a joint bound over all sources of randomness. A small
+response payoff does not certify proximity to Nash equilibrium.
 
 ## Design references
 

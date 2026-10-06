@@ -177,6 +177,32 @@ def test_paired_comparison_refuses_partial_from_another_stream(game, tmp_path):
                                    resume_partial=True), progress_path=partial)
 
 
+def test_production_resumes_interrupted_prefix_with_identical_scores(game, tmp_path, monkeypatch):
+    from fhp_evaluation.best_response import worker
+    partial = tmp_path / "partial.json"
+    spec = dict(deals=3, seed=20261007, search_seed=731, rollouts=2,
+                resume_partial=True, record_pair_timings=True)
+    expected = compare(game, PolicyAdapter(FixedPolicy(game, "uniform")), spec)
+    original_play = worker.play_hand
+    calls = []
+    def interrupt_after_one_pair(*args, **kwargs):
+        if len(calls) == 4:
+            raise RuntimeError("simulated interruption")
+        calls.append(True)
+        return original_play(*args, **kwargs)
+    monkeypatch.setattr(worker, "play_hand", interrupt_after_one_pair)
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        compare(game, PolicyAdapter(FixedPolicy(game, "uniform")), spec, progress_path=partial)
+    prefix = json.loads(partial.read_text())
+    assert prefix["completed_pairs"] == 1 and len(prefix["pair_elapsed_seconds"]) == 1
+    monkeypatch.setattr(worker, "play_hand", original_play)
+    actual = compare(game, PolicyAdapter(FixedPolicy(game, "uniform")), spec, progress_path=partial)
+    assert actual["pair_payoffs_mbb"] == expected["pair_payoffs_mbb"]
+    assert actual["seat_payoffs_chips"] == expected["seat_payoffs_chips"]
+    assert actual["pair_elapsed_seconds"][0] == prefix["pair_elapsed_seconds"][0]
+    assert len(actual["pair_elapsed_seconds"]) == 3
+
+
 @pytest.mark.parametrize("kind,code,limit,seconds", [
     ("time_limit", "import time; time.sleep(10)", 2048, .3),
     ("memory_limit", "import time; x=bytearray(100*1024**2); time.sleep(10)", 40, 10),

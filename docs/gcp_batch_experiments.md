@@ -208,7 +208,8 @@ reported as successful job completion.
 Experiment 5 freezes the 24-hour policies from Experiment 9 training seeds 0,
 1 and 2. For each policy it evaluates 2,000 fresh duplicate pairs (4 shards of
 500), with both seats per pair, 4,096 preflop rollouts and the pilot-selected two
-CPU threads. There are 6,000 pairs/12,000 hands in total. Corresponding shards
+CPU threads. There are 6,000 model/pair evaluations: 12,000 hands per responder,
+or 24,000 hands across both responders. Corresponding shards
 across training seeds use identical deal/action streams; LBR and exact-flop use
 the same stream within every shard. The four streams are distinct from the pilot.
 
@@ -220,9 +221,36 @@ its protocol, source bundle, checkpoint hash and random stream identity match.
 The separately cost-gated aggregate job can only be submitted after all 12
 `SUCCESS.json` markers exist. Its primary estimate is the unweighted mean of the
 three seed-level paired exact-flop-minus-LBR differences, with a Student-*t*
-interval over training seeds. The pooled pair-level interval is secondary and
-conditional on the frozen policies. Both response scores remain whole-game
+interval over training seeds, conditional on the shared evaluation deal panel.
+The secondary Monte Carlo interval first averages each matching deal across the
+three frozen models, then uses the 2,000 independent deal-panel means. It does
+not treat all 6,000 correlated model/pair scores as independent. Neither interval
+jointly captures training and evaluation randomness. Both response scores remain whole-game
 exploitability lower bounds because preflop is still LBR.
+
+Protocol version 2 hashes completed result files, checks pair/seat payoff
+consistency, records completed-pair timings and peak process memory, and pins
+the aggregation runtime to the same Python/Torch versions as workers. Periodic
+machine/process snapshots are uploaded with shard progress. The responder
+decisions and fixed sample budget are unchanged. The pilot's ~11.5 seconds per
+pair suggests ~1.6 hours of scoring per shard, not a guarantee on different VMs.
+
+### UCV-root convenience launcher
+
+The UCV repo now includes `gcp/run_exp9_best_response_production.sh`, delegating
+to this suite. Its `prepare-smoke`, `smoke`, `aggregate-smoke` actions verify the
+complete cloud path under a separate run ID. Once those succeed, use a new run
+ID and `prepare`, `run`, then `aggregate` after workers succeed. Preparation is
+offline; each other action explicitly submits a paid job. `status` is read-only.
+Nothing is automatically submitted after smoke or worker completion.
+
+The default shared checkout is `../../fhp-evaluation-suite` relative to the UCV
+repo root (`FHP_EVAL_REPO` overrides it). Prepared inputs live under the UCV
+`outputs/batch/$RUN_ID` (`FHP_BATCH_OUTPUT_DIR` overrides it). No `REPO_REF` is
+required because preparation snapshots allowlisted source and hashes it. Keep
+the prepared directory for submission and recovery. Old protocol-1 requests are
+not silently upgraded. Cloud smoke is a manual prerequisite; pilot, smoke and
+time-limited partial outcomes are not pooled into production inference.
 
 ### 1. Prepare an immutable request (no cloud calls)
 
@@ -237,7 +265,7 @@ python3 gcp/exp5_ucv_exp9_br_production_batch.py prepare \
 
 Review `outputs/batch/$RUN_ID/request.json`, `workers_job.json`,
 `aggregate_job.json`, and the source manifest inside `source.tar.gz`. Preparation
-does not contact GCP. Submission verifies the exact prepared bundle hash; source
+does not contact GCP. Submission verifies the prepared bundle and job-file hashes; source
 changes require a new run ID and a new preparation.
 
 For the first infrastructure check, prepare a distinct ID with `--smoke`; repeat
@@ -267,10 +295,13 @@ python3 gcp/exp5_ucv_exp9_br_production_batch.py submit-recovery \
   --recovery-tag r1
 ```
 
-Recovery requires the existing namespace and refuses an occupied recovery job
+Recovery requires the existing namespace and refuses active/unknown prior
+attempts, or an occupied recovery job
 name. It reuses the reviewed local request/bundle and does not overwrite cloud
 inputs. Every task fails closed if restored metadata differs from its immutable
-source/checkpoint/protocol identity.
+source/checkpoint/protocol identity. From the UCV root the equivalent is
+`RECOVERY_TAG=r1 bash gcp/run_exp9_best_response_production.sh recover`
+(use `recover-smoke` for smoke). Do not extend the sample until significance.
 
 ### 3. Submit aggregation only after all workers succeed
 
@@ -281,9 +312,11 @@ gcloud batch jobs describe "${RUN_ID}-aggregate" \
   --project "$PROJECT_ID" --location "$REGION" --format='yaml(status)'
 ```
 
-Preflight requires exactly 12 worker success markers and an empty analysis
-prefix. Important outputs are `analysis/aggregate_summary.json`,
-`analysis/seed_summary.csv`, `analysis/report.md`, and `analysis/SUCCESS.json`.
+Preflight requires 12 worker success markers, a successful worker/recovery Batch
+job including final uploads, no active attempt, and an empty analysis prefix.
+Outputs are `analysis/aggregate_summary.json`, `analysis/seed_summary.csv`,
+`analysis/shard_timings.csv`, `analysis/report.md`, and `analysis/SUCCESS.json`.
+Timing reports cover completed pair scoring, not total elapsed or billable time.
 
 ### 4. Download final analysis and raw shards
 

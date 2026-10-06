@@ -15,12 +15,14 @@ exec > >(tee -a "$OUTPUT/bootstrap.log") 2>&1
 MAIN_STAGE=initialization
 stage() { MAIN_STAGE="$1"; printf '[%s] stage=%s task=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$MAIN_STAGE" "$TASK_NAME"; }
 SYNC_PID=""
+MONITOR_PID=""
 sync_outputs() {
   flock -w 5 "$WORK/upload.lock" timeout 90 gcloud storage rsync --recursive --exclude='.*[.]tmp$' "$OUTPUT" "$REMOTE"
 }
 cleanup() {
   exit_code="$?"; set +e
   if [[ -n "$SYNC_PID" ]]; then kill "$SYNC_PID" 2>/dev/null; wait "$SYNC_PID" 2>/dev/null; fi
+  if [[ -n "$MONITOR_PID" ]]; then kill "$MONITOR_PID" 2>/dev/null; wait "$MONITOR_PID" 2>/dev/null; fi
   printf '{"main_exit_code":%s,"stage":"%s"}\n' "$exit_code" "$MAIN_STAGE" > "$OUTPUT/main_exit.json"
   sync_outputs || echo "WARNING: exit upload failed; final runnable will retry."
   exit "$exit_code"
@@ -35,6 +37,14 @@ if [[ -n "$REMOTE_OBJECT" ]]; then
   gcloud storage rsync --recursive "$REMOTE" "$OUTPUT"
 fi
 while sleep 60; do sync_outputs || echo "WARNING: periodic upload failed"; done & SYNC_PID="$!"
+# Persist lightweight machine/process diagnostics, including before Python setup.
+while true; do
+  date -u '+%Y-%m-%dT%H:%M:%SZ'
+  free -m || true
+  ps -eo pid,ppid,pcpu,pmem,rss,comm --sort=-rss | head -20 || true
+  if [[ -r /sys/fs/cgroup/memory.events ]]; then cat /sys/fs/cgroup/memory.events; fi
+  sleep 30
+done >> "$OUTPUT/resource_snapshots.log" 2>&1 & MONITOR_PID="$!"
 
 stage source_download
 timeout 180 gcloud storage cp "$FHP_BUNDLE_URI" "$WORK/source.tar.gz"
@@ -68,6 +78,8 @@ UV="$WORK/bootstrap-venv/bin/uv"
 "$WORK/venv/bin/pip" install --disable-pip-version-check --no-cache-dir -r "$WORK/source/evaluator/gcp/requirements-br-pilot.txt"
 "$WORK/venv/bin/pip" check
 FHP_BOOTSTRAP
+"$WORK/venv/bin/python" --version > "$OUTPUT/python_version.txt"
+"$WORK/venv/bin/pip" freeze > "$OUTPUT/pip_freeze.txt"
 
 stage evaluation
 export PYTHONPATH="$WORK/source/evaluator"

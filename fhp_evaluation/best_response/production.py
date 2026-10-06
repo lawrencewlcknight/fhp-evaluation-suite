@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 import platform
+import resource
+import sys
 import time
 
 import numpy as np
@@ -17,7 +19,7 @@ from .runner import identity, write_json
 
 
 EXPERIMENT = "exp5_ucv_exp9_br_production_3seed"
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 SOURCE_RUN = "exp9-cache24-20261001-132550"
 TRAINING_SEEDS = (0, 1, 2)
 SHARDS_PER_SEED = 4
@@ -77,6 +79,7 @@ def contract(*, smoke=False):
         "common_random_numbers": "same shard deal/action stream for all training seeds and both responders",
         "primary_inference_unit": "training_seed",
         "primary_estimand": "unweighted mean seed-level paired exact-flop-minus-LBR response payoff",
+        "conditional_inference_unit": "shared_deal_pair_averaged_across_frozen_training_seeds",
         "exact_full_game": False,
     }
 
@@ -125,6 +128,8 @@ def run_shard(task_index, checkpoint, repo_root, output_dir, source_bundle_sha25
                 or not result_path.is_file()):
             raise ValueError("Successful shard marker is missing its complete result")
         previous_result = json.loads(result_path.read_text())
+        if sha256_file(result_path) != previous.get("result_sha256"):
+            raise ValueError("Successful shard result checksum mismatch")
         if (previous_result.get("task_index") != task_index
                 or previous_result.get("training_seed") != training_seed
                 or previous_result.get("shard_index") != shard
@@ -165,16 +170,20 @@ def run_shard(task_index, checkpoint, repo_root, output_dir, source_bundle_sha25
         "deals": 2 if smoke else PAIRS_PER_SHARD,
         "rollouts": 8 if smoke else ROLLOUTS,
         "resume_partial": True,
+        "record_pair_timings": True,
     }
     started = time.monotonic()
     try:
         evaluation_identity = identity(spec)
         write_json(output / "spec.json", spec)
         result = execute(spec, progress_path=output / "partial.json")
+        peak_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
         result.update(experiment=EXPERIMENT, protocol_version=PROTOCOL_VERSION,
                       training_seed=training_seed, shard_index=shard, task_index=task_index,
                       source_bundle_sha256=source_bundle_sha256,
-                      evaluation_identity=evaluation_identity)
+                      evaluation_identity=evaluation_identity,
+                      current_invocation_seconds=time.monotonic() - started,
+                      peak_rss_bytes=int(peak_rss if sys.platform == "darwin" else peak_rss * 1024))
         write_json(output / "result.json", result)
         manifest.update(status="succeeded", completed_utc=utc_now(),
                         elapsed_seconds=time.monotonic() - started,
@@ -182,7 +191,8 @@ def run_shard(task_index, checkpoint, repo_root, output_dir, source_bundle_sha25
         write_json(manifest_path, manifest)
         success = {"identity": shard_identity, "status": "succeeded",
                    "completed_utc": manifest["completed_utc"],
-                   "completed_pairs": result["num_deal_pairs"]}
+                   "completed_pairs": result["num_deal_pairs"],
+                   "result_sha256": sha256_file(output / "result.json")}
         write_json(success_path, success)
         return success
     except BaseException as error:
@@ -203,10 +213,13 @@ def _write_csv(path, rows):
 
 
 def aggregate(workers_root, output_dir, source_bundle_sha256, *, smoke=False):
+    from ..loaders import sha256_file
+    from ..game import MILLI_BIG_BLINDS_PER_CHIP
     workers_root, output = Path(workers_root).resolve(), Path(output_dir).resolve()
     if output.exists() and any(output.iterdir()):
         raise FileExistsError(f"Refusing to overwrite non-empty aggregate directory: {output}")
-    output.mkdir(parents=True, exist_ok=True)
+    if output.is_relative_to(workers_root) or workers_root.is_relative_to(output):
+        raise ValueError("Worker inputs and analysis output must be disjoint")
     expected_contract = contract(smoke=smoke)
     per_seed = {seed: {"lbr": [], "full_flop": []} for seed in TRAINING_SEEDS}
     worker_rows = []
@@ -227,6 +240,8 @@ def aggregate(workers_root, output_dir, source_bundle_sha256, *, smoke=False):
         if success.get("identity") != expected_identity or success.get("status") != "succeeded":
             raise ValueError(f"Shard identity/status mismatch: {directory}")
         result = json.loads((directory / "result.json").read_text())
+        if sha256_file(directory / "result.json") != success.get("result_sha256"):
+            raise ValueError(f"Shard result checksum mismatch: {directory}")
         if (result.get("training_seed"), result.get("shard_index"), result.get("task_index")) != (seed, shard, task_index):
             raise ValueError(f"Shard result metadata mismatch: {directory}")
         if (result.get("protocol_version") != PROTOCOL_VERSION
@@ -239,6 +254,8 @@ def aggregate(workers_root, output_dir, source_bundle_sha256, *, smoke=False):
         values = result.get("pair_payoffs_mbb", {})
         seats = result.get("seat_payoffs_chips", {})
         requested = expected_contract["pairs_per_shard"]
+        if success.get("completed_pairs") != requested or result.get("num_deal_pairs") != requested:
+            raise ValueError(f"Incomplete shard completion counters: {directory}")
         if any(len(values.get(label, ())) != requested for label in ("lbr", "full_flop")):
             raise ValueError(f"Incomplete raw pair scores: {directory}")
         if any(len(seats.get(label, ())) != 2
@@ -247,22 +264,31 @@ def aggregate(workers_root, output_dir, source_bundle_sha256, *, smoke=False):
             raise ValueError(f"Incomplete raw seat scores: {directory}")
         if not all(np.isfinite(values[label]).all() for label in ("lbr", "full_flop")):
             raise ValueError(f"Non-finite raw pair scores: {directory}")
+        for label in ("lbr", "full_flop"):
+            seat_values = np.asarray(seats[label], dtype=float)
+            if (not np.isfinite(seat_values).all() or not np.allclose(
+                    seat_values.mean(axis=0) * MILLI_BIG_BLINDS_PER_CHIP,
+                    values[label], rtol=0, atol=1e-9)):
+                raise ValueError(f"Pair/seat payoff mismatch: {directory}")
+        timings = np.asarray(result.get("pair_elapsed_seconds", []), dtype=float)
+        if timings.shape != (requested,) or not np.isfinite(timings).all() or np.any(timings < 0):
+            raise ValueError(f"Missing or invalid complete pair timings: {directory}")
         per_seed[seed]["lbr"].extend(values["lbr"])
         per_seed[seed]["full_flop"].extend(values["full_flop"])
         worker_rows.append({"task_index": task_index, "training_seed": seed, "shard_index": shard,
                             "evaluation_seed": SHARD_EVALUATION_SEEDS[shard],
-                            "pairs": requested, "checkpoint_sha256": CHECKPOINTS[seed]["sha256"]})
+                            "pairs": requested, "checkpoint_sha256": CHECKPOINTS[seed]["sha256"],
+                            "comparison_seconds": float(timings.sum()),
+                            "seconds_per_pair": float(timings.mean()),
+                            "peak_rss_bytes": result.get("peak_rss_bytes"),
+                            "result_sha256": success["result_sha256"]})
     seed_rows, seed_deltas = [], []
-    pooled_lbr, pooled_flop, pooled_delta = [], [], []
     for seed in TRAINING_SEEDS:
         lbr = np.asarray(per_seed[seed]["lbr"], dtype=float)
         flop = np.asarray(per_seed[seed]["full_flop"], dtype=float)
         delta = flop - lbr
         lbr_summary, flop_summary, delta_summary = map(_finite_summary, (lbr, flop, delta))
         seed_deltas.append(delta_summary["mean"])
-        pooled_lbr.extend(lbr.tolist())
-        pooled_flop.extend(flop.tolist())
-        pooled_delta.extend(delta.tolist())
         seed_rows.append({
             "training_seed": seed, "pairs": len(delta),
             "lbr_mean_mbb_per_hand": lbr_summary["mean"],
@@ -274,17 +300,28 @@ def aggregate(workers_root, output_dir, source_bundle_sha256, *, smoke=False):
             "paired_delta_ci95_high": delta_summary["ci95_high"],
         })
     primary = _finite_summary(seed_deltas)
-    pooled = {
-        "lbr": _finite_summary(pooled_lbr),
-        "full_flop": _finite_summary(pooled_flop),
-        "paired_improvement": _finite_summary(pooled_delta),
+    # Corresponding pairs share random streams across models. Average over the
+    # fixed model panel BEFORE estimating Monte Carlo uncertainty; treating all
+    # 6,000 model/pair scores as independent would discard this covariance.
+    panel_lbr = np.asarray([per_seed[s]["lbr"] for s in TRAINING_SEEDS]).mean(axis=0)
+    panel_flop = np.asarray([per_seed[s]["full_flop"] for s in TRAINING_SEEDS]).mean(axis=0)
+    conditional = {
+        "lbr": _finite_summary(panel_lbr),
+        "full_flop": _finite_summary(panel_flop),
+        "paired_improvement": _finite_summary(panel_flop - panel_lbr),
     }
+    total_pairs = sum(row["pairs"] for row in seed_rows)
     summary = {
         "experiment": EXPERIMENT,
         "status": "complete",
         "completed_utc": utc_now(),
         "contract": expected_contract,
         "source_bundle_sha256": source_bundle_sha256,
+        "model_pair_evaluations": total_pairs,
+        "hands_per_responder": total_pairs * 2,
+        "total_hands_both_responders": total_pairs * 4,
+        "comparison_worker_seconds": sum(r["comparison_seconds"] for r in worker_rows),
+        "timing_scope": "Completed pair scoring only; excludes setup/upload, idle time and interrupted unsaved work.",
         "workers": worker_rows,
         "seed_results": seed_rows,
         "primary_training_seed_inference": {
@@ -292,19 +329,27 @@ def aggregate(workers_root, output_dir, source_bundle_sha256, *, smoke=False):
             "units": "mbb_per_hand",
             "quantity": "paired_exact_flop_minus_lbr_response_payoff",
             "ci_method": "Student_t_over_three_training_seed_means",
+            "warning": "Only three training seeds; conditional on the shared deal panel, not a joint bound over training and deal randomness.",
         },
         "secondary_pair_level_conditional_summary": {
-            **pooled,
-            "warning": "Conditional Monte Carlo precision only; duplicate pairs are not independent training seeds.",
+            **conditional,
+            "ci_method": "Student_t_over_shared_deal_pair_panel_means",
+            "independent_deal_pairs": len(panel_lbr),
+            "warning": "Conditional on the three frozen models. Shared-deal scores are averaged across models before computing uncertainty; this is not training-seed uncertainty.",
         },
         "interpretation": ("Both response scores are whole-game exploitability lower-bound estimates. "
                            "The flop continuation is exact but preflop remains LBR; this is not exact exploitability."),
     }
     write_json(output / "aggregate_summary.json", summary)
     _write_csv(output / "seed_summary.csv", seed_rows)
+    _write_csv(output / "shard_timings.csv", worker_rows)
     primary_mean = primary["mean"]
     report = "# Experiment 5 production result\n\n"
-    report += f"Status: complete. Evaluated {len(pooled_delta):,} fresh duplicate pairs ({2 * len(pooled_delta):,} hands) over three frozen training seeds.\n\n"
+    report += (f"Status: complete. Evaluated {total_pairs:,} model/pair combinations over three frozen training seeds, "
+               f"using {len(panel_lbr):,} shared independent deal pairs. Each responder played {2 * total_pairs:,} hands; "
+               f"both responders together played {4 * total_pairs:,} hands.\n\n")
+    if smoke:
+        report += "**SMOKE ONLY: execution check, not policy-strength evidence.**\n\n"
     report += "| Training seed | Pairs | LBR mean | Exact-flop mean | Paired delta | 95% pair-level CI for delta |\n|---:|---:|---:|---:|---:|---:|\n"
     for row in seed_rows:
         report += (f"| {row['training_seed']} | {row['pairs']:,} | {row['lbr_mean_mbb_per_hand']:.1f} | "
@@ -312,8 +357,16 @@ def aggregate(workers_root, output_dir, source_bundle_sha256, *, smoke=False):
                    f"[{row['paired_delta_ci95_low']:.1f}, {row['paired_delta_ci95_high']:.1f}] |\n")
     report += (f"\nPrimary result: unweighted mean seed-level paired delta **{primary_mean:.1f} mbb/hand** "
                f"(95% Student-t interval across 3 seeds [{primary['ci95_low']:.1f}, {primary['ci95_high']:.1f}]).\n\n"
-               "The pooled pair-level interval is secondary and conditional on these three trained policies. "
+               "This interval reflects variation across only three training seeds, conditional on the shared deal panel. "
+               "The separate deal-level interval averages matching deals across the frozen models first, preserving their covariance. "
                "Neither response is exact full-game exploitability because preflop remains approximate LBR.\n")
+    delta = conditional["paired_improvement"]
+    report += (f"\nConditional Monte Carlo paired improvement: {delta['mean']:.1f} mbb/hand "
+               f"[{delta['ci95_low']:.1f}, {delta['ci95_high']:.1f}] over {delta['n']:,} deal-panel means. "
+               "Neither interval is a joint uncertainty bound over both training and evaluation randomness.\n\n"
+               f"Completed scoring time: {summary['comparison_worker_seconds'] / 3600:.2f} worker-hours, "
+               "summed across shards; this is not elapsed Batch time or total billable compute. "
+               "See shard_timings.csv for per-shard throughput and process peak RSS.\n")
     (output / "report.md").write_text(report)
     write_json(output / "SUCCESS.json", {"experiment": EXPERIMENT, "status": "complete",
                                           "completed_utc": summary["completed_utc"],

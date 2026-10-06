@@ -87,6 +87,7 @@ def compare(game, target, spec, *, progress_path=None):
     rng = np.random.default_rng(spec["seed"])
     values = {"lbr": [], "full_flop": []}
     seats = {"lbr": [[], []], "full_flop": [[], []]}
+    pair_seconds = []
     start = 0
     progress_identity = {
         "schema_version": 1,
@@ -94,6 +95,7 @@ def compare(game, target, spec, *, progress_path=None):
         "search_seed": int(spec["search_seed"]),
         "preflop_rollouts": int(spec["rollouts"]),
         "requested_pairs": int(spec["deals"]),
+        "record_pair_timings": bool(spec.get("record_pair_timings", False)),
     }
     if progress_path is not None and spec.get("resume_partial") and Path(progress_path).is_file():
         previous = json.loads(Path(progress_path).read_text())
@@ -113,11 +115,17 @@ def compare(game, target, spec, *, progress_path=None):
             raise ValueError("Malformed partial comparison payload")
         values = {label: list(previous_values[label]) for label in values}
         seats = {label: [list(row) for row in previous_seats[label]] for label in seats}
+        if spec.get("record_pair_timings"):
+            pair_seconds = previous.get("pair_elapsed_seconds", [])
+            if (len(pair_seconds) != start or not np.isfinite(pair_seconds).all()
+                    or any(seconds < 0 for seconds in pair_seconds)):
+                raise ValueError("Malformed partial pair timings")
         for _ in range(start):
             rng.integers(0, 2**63 - 1)
             rng.integers(0, 2**63 - 1)
         event("comparison_resumed", completed=start, total=spec["deals"])
     for index in range(start, spec["deals"]):
+        pair_started = time.perf_counter()
         chance, action = (int(rng.integers(0, 2**63 - 1)) for _ in range(2))
         for label, responder in (("lbr", baseline), ("full_flop", improved)):
             if len(baseline._action_cache) >= 2048:
@@ -127,6 +135,8 @@ def compare(game, target, spec, *, progress_path=None):
             seats[label][0].append(p0)
             seats[label][1].append(p1)
             values[label].append(.5 * (p0 + p1) * MILLI_BIG_BLINDS_PER_CHIP)
+        if spec.get("record_pair_timings"):
+            pair_seconds.append(time.perf_counter() - pair_started)
         if progress_path is not None:
             # Preserve completed pairs if the watchdog interrupts the worker.
             # No CI: time-limited partial samples are not final inferential results.
@@ -134,6 +144,7 @@ def compare(game, target, spec, *, progress_path=None):
                                            requested_pairs=spec["deals"], pair_payoffs_mbb=values,
                                            seat_payoffs_chips=seats, evaluation_seed=spec["seed"],
                                            progress_identity=progress_identity,
+                                           pair_elapsed_seconds=pair_seconds,
                                            scope="partial_payoff_diagnostics_not_a_final_estimate"))
         event("deal_pair_completed", completed=index + 1, total=spec["deals"])
     return dict(experiment="exp3_br_checkpoint_comparison", metric="exploitability_lower_bound_estimate",
@@ -142,6 +153,7 @@ def compare(game, target, spec, *, progress_path=None):
                 lbr=summary(values["lbr"]), full_flop=summary(values["full_flop"]),
                 paired_improvement=summary(np.subtract(values["full_flop"], values["lbr"])),
                 pair_payoffs_mbb=values, seat_payoffs_chips=seats,
+                pair_elapsed_seconds=pair_seconds,
                 sampling_ci_method="Student_t_over_independent_duplicate_pairs",
                 response_approximation_error="not_bounded_by_the_sampling_confidence_interval",
                 interpretation="CIs measure payoff sampling uncertainty, not distance to a true best response.")

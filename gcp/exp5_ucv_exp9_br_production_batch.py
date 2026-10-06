@@ -157,12 +157,26 @@ def _read(*command):
 def cloud_preflight(args, stage, job_id, *, recovery=False):
     _read("gcloud", "iam", "service-accounts", "describe", args.service_account,
           "--project", args.project, "--format=value(email)")
+    if recovery or stage == "aggregate":
+        attempts = json.loads(_read("gcloud", "batch", "jobs", "list", "--project", args.project,
+                                    "--location", args.region, "--filter", f"name:{args.run_id}-", "--format=json"))
+        if not isinstance(attempts, list):
+            raise ValueError("Invalid Batch attempt listing")
+        run_prefix = f"projects/{args.project}/locations/{args.region}/jobs/{args.run_id}-"
+        attempts = [job for job in attempts if str(job.get("name", "")).startswith(run_prefix)]
+        if any(job.get("status", {}).get("state") not in ("SUCCEEDED", "FAILED") for job in attempts):
+            raise ValueError("A prior attempt is active or has an unknown state; refusing concurrent output writes")
+        if stage == "aggregate" and not any(
+                job.get("status", {}).get("state") == "SUCCEEDED"
+                and (job["name"] == run_prefix + "workers" or job["name"].startswith(run_prefix + "r-"))
+                for job in attempts):
+            raise ValueError("Aggregation requires a successful workers/recovery Batch job including final uploads")
     if stage == "workers":
         for relative, _ in CHECKPOINTS.values():
             metadata = json.loads(_read("gcloud", "storage", "objects", "describe",
                 f"{args.bucket}/{SOURCE_RUN}/{relative}", "--format=json"))
             size = metadata.get("size", metadata.get("sizeBytes"))
-            if size is not None and not 0 < int(size) <= 256 * 1024**2:
+            if size is None or not 0 < int(size) <= 256 * 1024**2:
                 raise ValueError("Unexpected checkpoint size")
         prefix = (f"{args.bucket}/{args.run_id}/workers/**" if recovery
                   else f"{args.bucket}/{args.run_id}/**")
@@ -196,6 +210,16 @@ def _request_matches(args, request):
         raise ValueError("Submission arguments differ from the prepared request")
 
 
+def verify_prepared_files(run_dir, request):
+    """Do not silently submit an edited job or a re-generated source bundle."""
+    for name in ("source.tar.gz", "workers_job.json", "aggregate_job.json"):
+        expected = request.get("prepared_files_sha256", {}).get(name)
+        if not expected or sha256(Path(run_dir) / name) != expected:
+            raise ValueError(f"Prepared input checksum mismatch or legacy request: {name}; prepare a new run ID")
+    if request["prepared_files_sha256"]["source.tar.gz"] != request["bundle_sha256"]:
+        raise ValueError("Prepared source bundle identity differs")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("prepare", "submit-workers", "submit-recovery", "submit-aggregate"))
@@ -221,15 +245,16 @@ def main():
         request = {"run_id": args.run_id, "project": args.project, "region": args.region,
                    "bucket": args.bucket, "service_account": args.service_account, "smoke": args.smoke,
                    "bundle_sha256": bundle_hash, "source": provenance,
-                   "checkpoint_sha256": {str(k): v[1] for k, v in CHECKPOINTS.items()}}
+                   "checkpoint_sha256": {str(k): v[1] for k, v in CHECKPOINTS.items()},
+                   "prepared_files_sha256": {name: sha256(run_dir / name) for name in (
+                       "source.tar.gz", "workers_job.json", "aggregate_job.json")}}
         (run_dir / "request.json").write_text(json.dumps(request, indent=2) + "\n")
         print(f"Prepared immutable production request in {run_dir}; no cloud calls made.")
         return
     request = json.loads((run_dir / "request.json").read_text())
     _request_matches(args, request)
     bundle = run_dir / "source.tar.gz"
-    if sha256(bundle) != request["bundle_sha256"]:
-        raise ValueError("Prepared source bundle hash mismatch")
+    verify_prepared_files(run_dir, request)
     recovery = args.action == "submit-recovery"
     stage = "workers" if args.action in ("submit-workers", "submit-recovery") else "aggregate"
     if recovery:
