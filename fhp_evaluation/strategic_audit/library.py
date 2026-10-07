@@ -40,13 +40,15 @@ def build_library(seed=20261006, *, pilot=False, reference_deals=64):
             board = sorted(4 * (c // 4) + int(labels[c % 4]) for c in groups[kind][index])
             rows.append(dict(board=board, texture=kind,
                              partition="development" if i < development else "assessment"))
+    # Preserve the full holdout even when the pilot drops assessment rows.
+    # Otherwise pilot reference deals could accidentally expose a locked board.
+    heldout = {canonical_board(r["board"]) for r in rows if r["partition"] == "assessment"}
     if pilot:
         # Six textures plus two additional unpaired boards. No assessment access.
         selected = [next(r for r in rows if r["texture"] == kind) for kind in quotas]
         selected += [r for r in rows if r["texture"] == "unpaired_3suit"
                      and r not in selected][:2]
         rows = selected
-    heldout = {canonical_board(r["board"]) for r in rows if r["partition"] == "assessment"}
     # Independent full-deck deals, not a uniform sample of suit classes. Exclude
     # locked board classes so the reference view cannot leak the assessment set.
     deals = []
@@ -56,6 +58,7 @@ def build_library(seed=20261006, *, pilot=False, reference_deals=64):
             continue
         deals.append(dict(cards=cards, action_seed=int(rng.integers(0, 2**63))))
     result = dict(protocol=PROTOCOL, seed=int(seed), pilot=bool(pilot), boards=rows,
+                  assessment_board_classes=[list(b) for b in sorted(heldout)],
                   reference_deals=deals, reference_sampling="uniform deals conditional on non-assessment board class",
                   partition_counts=dict(Counter(r["partition"] for r in rows)))
     validate_library(result)
@@ -79,6 +82,13 @@ def validate_library(library):
         seen.add(key)
     heldout = {canonical_board(r["board"]) for r in library["boards"]
                if r["partition"] == "assessment"}
+    for board in library.get("assessment_board_classes", []):
+        if (len(board) != 3 or len(set(board)) != 3 or
+                any(type(c) is not int or not 0 <= c < 52 for c in board)):
+            raise ValueError("Invalid locked board class")
+        heldout.add(canonical_board(board))
+    if any(canonical_board(r["board"]) in heldout for r in library["boards"] if r["partition"] == "development"):
+        raise ValueError("Development/assessment leakage")
     for deal in library.get("reference_deals", []):
         cards = deal["cards"]
         if (len(cards) != 7 or len(set(cards)) != 7 or

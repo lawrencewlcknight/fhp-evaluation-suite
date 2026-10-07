@@ -21,6 +21,12 @@ workers and HTML/SVG/JSON reports are included. A generator pins the six Exp9/10
 [the strategic-audit guide](docs/strategic_audit.md). This is not whole-game
 exploitability and does not modify or retrain policies.
 
+Evaluation **Experiment 6** applies the audit to UCV training Experiment 16:
+a seed-0 24h/48h cloud pilot, then a separately approved three-seed
+24h/36h/42h/48h development comparison. It pins all checkpoint hashes and uses
+the same eight-opponent panel throughout. See the
+[Experiment 16 audit protocol and launch instructions](docs/exp16_strategic_audit.md).
+
 The released DeepPDCFR code contains `LooseAggressive=(-100,-300)`. That
 ordering makes its middle (call) branch unreachable. The suite treats it as a
 transposition error and uses `(-300,-100)`. `StrengthBands` rejects reversed

@@ -44,7 +44,7 @@ def git_provenance(root):
     return {"commit": read("rev-parse", "HEAD"), "dirty": bool(read("status", "--porcelain"))}
 
 
-def make_bundle(evaluation_root, native_root, destination):
+def make_bundle(evaluation_root, native_root, destination, *, extra_files=()):
     evaluation_root, native_root = Path(evaluation_root).resolve(), Path(native_root).resolve()
     candidates = {}
     for source_root, prefix, packages in ((evaluation_root, "evaluator", ("fhp_evaluation",)),
@@ -59,7 +59,7 @@ def make_bundle(evaluation_root, native_root, destination):
                  "gcp/run_exp5_ucv_exp9_br_production.sh",
                  "gcp/finalize_exp5_ucv_exp9_br_production.sh",
                  "gcp/aggregate_exp5_ucv_exp9_br_production.sh",
-                 "gcp/requirements-br-pilot.txt"):
+                 "gcp/requirements-br-pilot.txt", *extra_files):
         candidates[f"evaluator/{name}"] = evaluation_root / name
     files, size = {}, 0
     for name, path in candidates.items():

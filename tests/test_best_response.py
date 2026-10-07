@@ -205,7 +205,9 @@ def test_production_resumes_interrupted_prefix_with_identical_scores(game, tmp_p
 
 @pytest.mark.parametrize("kind,code,limit,seconds", [
     ("time_limit", "import time; time.sleep(10)", 2048, .3),
-    ("memory_limit", "import time; x=bytearray(100*1024**2); time.sleep(10)", 40, 10),
+    # Zero-filled bytearrays can remain shared zero pages (or be compressed) on
+    # macOS and never exceed the RSS limit. Keep incompressible resident bytes.
+    ("memory_limit", "import os, time; x=os.urandom(100*1024**2); time.sleep(10)", 40, 10),
     ("failed", "raise RuntimeError('intentional failure')", 2048, 10),
 ])
 def test_watchdog_and_failure_diagnostics(tmp_path, kind, code, limit, seconds):

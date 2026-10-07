@@ -26,12 +26,16 @@ paths = []
 
 if family == "ucv":
     from fhp_escher.features import FHPFeatureEncoder, StructuredFHPMLP, POLICY_LAYOUT
+    from fhp_escher.hand_board_features import FHPHandBoardFeatureEncoder, HAND_POLICY_LAYOUT
     from fhp_escher.card_policy import ResidualCardPolicy
     from vr_deep_cfr.solver import MLP
     encoder = FHPFeatureEncoder()
     models = [("raw", MLP(190, [8], 3), None),
               ("encoded", MLP(183, [8], 3), encoder),
               ("structured", StructuredFHPMLP(POLICY_LAYOUT, [8], 3, branch_width=4), encoder)]
+    models += [("hand_board", MLP(213, [8], 3), FHPHandBoardFeatureEncoder()),
+               ("hand_board_structured", StructuredFHPMLP(HAND_POLICY_LAYOUT, [8], 3, branch_width=4),
+                FHPHandBoardFeatureEncoder())]
     models += [(kind, ResidualCardPolicy(kind), encoder) for kind in ("dense", "deepsets", "attention")]
     for name, model, feature in models:
         with torch.no_grad():
@@ -39,7 +43,7 @@ if family == "ucv":
                 parameter.add_(torch.randn_like(parameter) * .03)
         payload = dict(type="fhp_ucv_escher_policy_checkpoint", version=1,
                        game=dict(parameters=dict(FHP_GAME_PARAMETERS)),
-                       input_size=190 if feature is None else 183, num_actions=3,
+                       input_size=190 if feature is None else feature.policy_layout.total_size, num_actions=3,
                        policy_network_layers=[8], feature_encoder=None if feature is None else feature.metadata(),
                        policy_model=model.checkpoint_metadata() if hasattr(model, "checkpoint_metadata") else {"type": "mlp_v1"},
                        policy_state_dict=model.state_dict())
@@ -93,6 +97,11 @@ for path in paths:
     target = load_target(game, path, family=family, repo_root=repo_root,
                          batch_size=3, model_batch_size=2)
     record = target.check_scalar_parity(states)
+    if family == "ucv" and path.stem.startswith("hand_board"):
+        from fhp_evaluation.strategic_audit.tables import BoardContext
+        from fhp_evaluation.strategic_audit.checks import check_adapter
+        record["strategic_checks"] = check_adapter(BoardContext(game, (16, 20, 32)), target,
+                                                    require_suit_invariance=True)
     record.update(checkpoint=path.name, family=family)
     records.append(record)
 print(json.dumps(records))
