@@ -39,17 +39,54 @@ tar -xzf "$WORK/source.tar.gz" -C "$WORK/source"
 cp "$WORK/source/source_manifest.json" "$OUTPUT/source_manifest.json"
 
 timeout --signal=TERM --kill-after=15 1800 /bin/bash -Eeuo pipefail <<'BOOTSTRAP'
+FHP_BOOTSTRAP_STAGE=initialization
+bootstrap_stage() {
+  FHP_BOOTSTRAP_STAGE="$1"
+  printf '[%s] BOOTSTRAP stage=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$FHP_BOOTSTRAP_STAGE"
+}
+trap 'printf "ERROR: BOOTSTRAP stage=%s line=%s exit_code=%s\n" "$FHP_BOOTSTRAP_STAGE" "$LINENO" "$?" >&2' ERR
+# Keep installation and venv selection on the same tested patch version. This
+# is the inference runtime used by the existing best-response evaluator.
+FHP_AUDIT_PYTHON_VERSION=3.11.13
+FHP_AUDIT_UV_VERSION=0.8.22
+FHP_AUDIT_PYTHON_REQUEST="cpython-${FHP_AUDIT_PYTHON_VERSION}-linux-x86_64-gnu"
+bootstrap_stage system_packages
 apt-get update
 apt-get install -y python3 python3-venv ca-certificates
+bootstrap_stage bootstrap_venv
 /usr/bin/python3 -I -m venv "$WORK/bootstrap-venv"
-"$WORK/bootstrap-venv/bin/pip" install --disable-pip-version-check uv==0.8.22
+bootstrap_stage uv_install
+"$WORK/bootstrap-venv/bin/pip" install --disable-pip-version-check "uv==$FHP_AUDIT_UV_VERSION"
 export UV_PYTHON_INSTALL_DIR="$WORK/python"
 UV="$WORK/bootstrap-venv/bin/uv"
-"$UV" python install 3.11.16
-"$UV" venv --python 3.11.16 --seed "$WORK/venv"
+bootstrap_stage python_availability
+# Query the pinned installer's built-in catalogue without downloading Python.
+# All-platform flags also let the identical check run on a developer's Mac.
+"$UV" python list "$FHP_AUDIT_PYTHON_REQUEST" --all-versions --all-platforms --all-arches \
+  --only-downloads --output-format json --offline --no-cache --no-config > "$WORK/output/python_downloads.json"
+/usr/bin/python3 -I - "$WORK/output/python_downloads.json" "$FHP_AUDIT_PYTHON_REQUEST" <<'PYTHON_CATALOG_CHECK'
+import json, sys
+with open(sys.argv[1]) as stream:
+    rows = json.load(stream)
+matches = [r for r in rows if isinstance(r, dict) and r.get("key") == sys.argv[2]
+           and isinstance(r.get("url"), str) and r["url"].startswith("https://")] if isinstance(rows, list) else []
+if len(matches) != 1:
+    raise SystemExit(f"Pinned uv cannot supply {sys.argv[2]}; align the Python and uv pins before retrying.")
+print(f"Verified managed Python download: {matches[0]['key']}")
+PYTHON_CATALOG_CHECK
+bootstrap_stage managed_python
+"$UV" python install "$FHP_AUDIT_PYTHON_VERSION"
+bootstrap_stage evaluation_venv
+"$UV" venv --python "$FHP_AUDIT_PYTHON_VERSION" --managed-python --no-python-downloads --seed "$WORK/venv"
+bootstrap_stage runtime_version
+"$WORK/venv/bin/python" -I -c 'import sys; assert sys.version_info[:3] == tuple(map(int, sys.argv[1].split("."))), sys.version' "$FHP_AUDIT_PYTHON_VERSION"
+bootstrap_stage torch_install
 "$WORK/venv/bin/pip" install --no-cache-dir torch==2.7.0+cpu --index-url https://download.pytorch.org/whl/cpu
+bootstrap_stage evaluation_dependencies
 "$WORK/venv/bin/pip" install --no-cache-dir -r "$WORK/source/evaluator/gcp/requirements-br-pilot.txt"
+bootstrap_stage dependency_check
 "$WORK/venv/bin/pip" check
+bootstrap_stage complete
 BOOTSTRAP
 export PYTHONPATH="$WORK/source/evaluator"
 export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 VECLIB_MAXIMUM_THREADS=4

@@ -95,9 +95,15 @@ to measure utilisation before considering cheaper scheduling for future studies.
 Batch caps are six hours for the pilot and 24 hours for development, including
 bootstrap/upload allowance. No automatic retries or automatic next-stage launch.
 
-The VM installs Python 3.11.16, CPU Torch 2.7.0, NumPy 1.26.4 and OpenSpiel 1.6.3
+The VM installs Python 3.11.13, CPU Torch 2.7.0, NumPy 1.26.4 and OpenSpiel 1.6.3
 with the suite's existing pinned inference requirements. No local ML environment
 is needed to prepare or submit; the local launcher uses the standard library.
+The pinned `uv==0.8.22` catalogue is checked for the exact Linux x86-64 GNU build
+before installing Python; `python_downloads.json` preserves this check's inputs.
+The created environment's actual Python patch version is also checked before
+installing the numerical dependencies. Setup logs identify the failing stage.
+These checks do not replace an actual cloud bootstrap test or guarantee that
+external download servers will be reachable.
 
 Only playable `.pkl` policies are downloaded. No full training states or replay
 reservoirs are loaded or generated. Outputs retain analysis, diagnostic logs,
@@ -193,6 +199,19 @@ code/runtime fingerprint and cached checksums must match; mixed-source recovery
 is rejected. Partial results are not published as a successful complete audit.
 If no source request reached GCS at all, use a fresh run ID.
 
+### Relaunch after the initial Python setup failure
+
+The first pilot, `fhp-strat16-pilot-20261008-003851`, stopped before evaluation:
+its `uv==0.8.22` installer could not supply Python 3.11.16. The corrected runtime
+uses the same Python 3.11.13 pin as the existing best-response evaluator. No
+model weights, numerical-library pins, or audit estimands change.
+
+After pulling this fix, use a **new** `PILOT_RUN_ID`/`RUN_ID`, then run `prepare`
+and `submit` as above. Do **not** use `recover` for that failed run: it deliberately
+reuses the immutable original source bundle and would repeat the setup failure.
+There is no completed policy evaluation to preserve from that attempt; the
+original training checkpoints are unaffected.
+
 ## Tests
 
 Run `python -m pytest -q` in the pinned evaluation environment. Set
@@ -201,3 +220,8 @@ Run `python -m pytest -q` in the pinned evaluation environment. Set
 The new tests cover checkpoint selection, assessment isolation, equal-panel
 weighting, paired seed inference, missing/mixed inputs, source-only bundles,
 offline preparation, cloud gates and shell syntax. No test submits cloud jobs.
+Bootstrap tests exercise the submitted shell's stage ordering and fail-fast
+behaviour with mocked installers. To additionally verify the real installer's
+offline catalogue (including rejection of the original 3.11.16 request), set
+`FHP_TEST_UV` to an existing `uv 0.8.22` executable and run
+`python -m pytest -q tests/test_strategic_bootstrap.py`.
