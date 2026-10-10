@@ -1,5 +1,10 @@
 # GCP Batch: Experiment 9 specialised best-response pilot
 
+For the newer **UCV Experiment 21 adversarial-preservation pilot**, including its
+separate cloud smoke, qualification, repair and evaluation jobs, use the
+[Experiment 21 protocol and step-by-step instructions](exp21_adversarial_preservation.md).
+The Experiment 9 evaluation-only instructions below are unchanged.
+
 Evaluation-suite experiment **`exp4_ucv_exp9_br_pilot`** evaluates the frozen
 UCV-Escher **training Experiment 9**, seed 0, at 24 hours. It does not train a
 model, evaluate other seeds, or compute exact full-game exploitability.

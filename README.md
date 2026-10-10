@@ -9,6 +9,17 @@ This repository is the single evaluation implementation shared by
 - a poker-specific Local Best Response (LBR) lower-bound probe;
 - collision-free checkpoint loading for all three policy formats.
 
+## UCV Experiment 21: adversarial policy improvement
+
+The opt-in `fhp_evaluation.adversarial` package implements a staged three-seed
+pilot on frozen Experiment 10 models: qualify learned attackers, compare four
+post-training arms, then independently evaluate with fresh attackers, duplicate
+play, reference panels and the existing specialised responder. It does not alter
+any default evaluator. See the [protocol and GCP instructions](docs/exp21_adversarial_preservation.md).
+The root launcher lives in the UCV repo; source bundles include both checkouts.
+This experiment modifies copies of policies, not the original checkpoints, and
+does not claim certified exploitability reduction.
+
 ## Strategic-position audit
 
 The `strategic-library`, `strategic-spec`, `strategic-validate` and `strategic-run`
