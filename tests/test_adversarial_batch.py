@@ -4,6 +4,7 @@ import argparse
 import importlib.util
 import json
 from pathlib import Path
+import shlex
 import subprocess
 import tarfile
 
@@ -85,4 +86,115 @@ def test_bundle_allowlist_contains_new_code_not_results(tmp_path):
     with tarfile.open(archive) as handle:
         names = handle.getnames()
     assert "evaluator/fhp_evaluation/adversarial/learning.py" in names
+    assert "evaluator/fhp_evaluation/adversarial/pipeline.py" in names
     assert not any("secret" in n or "cloud_outputs" in n for n in names)
+
+
+@pytest.mark.parametrize("smoke", [False, True])
+def test_single_job_resources_shell_and_no_child_submissions(tmp_path, smoke):
+    job = batch.build_pipeline_job(arguments(tmp_path, smoke), "a" * 64)
+    group = job["taskGroups"][0]
+    spec = group["taskSpec"]
+    assert group["taskCount"] == group["parallelism"] == group["taskCountPerNode"] == 1
+    assert spec["maxRetryCount"] == 0 and spec["maxRunDuration"] == "93600s"
+    assert spec["computeResource"] == dict(cpuMilli=48000, memoryMib=180000)
+    policy = job["allocationPolicy"]["instances"][0]["policy"]
+    assert policy["machineType"] == "n2-standard-48" and policy["bootDisk"]["sizeGb"] == 200
+    assert spec["environment"]["variables"]["FHP_SMOKE"] == str(int(smoke))
+    main, final = spec["runnables"]
+    assert final["alwaysRun"]
+    for runnable in (main, final):
+        script = runnable["script"]["text"]
+        subprocess.run(["bash", "-n"], input=script, text=True, check=True)
+        assert "gcloud batch" not in script
+        assert "FHP_TASK" not in script and "FHP_RUN_DESTINATION" not in script
+        assert '"$OUTPUT" "$FHP_DESTINATION"' in script
+        assert '"$FHP_DESTINATION/analysis"' not in script
+        assert "scientific_complete" in script and "sync_outputs 1" in script
+    assert "fhp_evaluation.adversarial.pipeline run" in main["script"]["text"]
+    assert "--smoke-only" in main["script"]["text"]
+    assert "final_system_diagnostics" in final["script"]["text"]
+
+
+def test_single_job_preflight_needs_fresh_namespace_not_external_smoke(monkeypatch, tmp_path):
+    calls = []
+    def fake(*command):
+        calls.append(command)
+        return "[]" if "list" in command else "{}"
+    monkeypatch.setattr(batch, "read", fake)
+    batch.preflight(arguments(tmp_path), {"bundle_sha256": "a" * 64}, "run")
+    assert not any("cat" in command for command in calls)
+    assert any("gs://test-bucket/exp21-adv-test/**" in command for command in calls)
+    monkeypatch.setattr(batch, "read", lambda *command: '[{"name":"existing"}]' if "list" in command else "{}")
+    with pytest.raises(ValueError, match="occupied"):
+        batch.preflight(arguments(tmp_path), {}, "run")
+
+
+def test_run_prepares_uploads_and_submits_once(monkeypatch, tmp_path):
+    args = arguments(tmp_path)
+    for package in ("fhp_escher", "vr_deep_cfr"):
+        (args.native_repo / package).mkdir(parents=True)
+        (args.native_repo / package / "__init__.py").write_text("")
+    original_run = subprocess.run
+    calls = []
+    def fake_run(command, **kwargs):
+        if command[0] == "gcloud":
+            calls.append(command)
+            return subprocess.CompletedProcess(command, 0)
+        return original_run(command, **kwargs)
+    monkeypatch.setattr(batch, "read", lambda *command: "[]" if "list" in command else "{}")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    argv = ["run", "--project", args.project, "--region", args.region, "--bucket", args.bucket,
+            "--service-account", args.service_account, "--run-id", args.run_id,
+            "--native-repo", str(args.native_repo), "--run-dir", str(args.run_dir)]
+    batch.main(argv)
+    request = json.loads((args.run_dir / "request.json").read_text())
+    assert request["layout"] == "single_job_v1" and not request["smoke"]
+    assert set(request["files"]) == {"source.tar.gz", "run_job.json"}
+    submissions = [c for c in calls if c[1:4] == ["batch", "jobs", "submit"]]
+    assert len(submissions) == 1 and submissions[0][4] == "exp21-adv-test-run"
+    uploads = [c for c in calls if c[1:3] == ["storage", "cp"]]
+    assert len(uploads) == 3 and all("--if-generation-match=0" in c for c in uploads)
+    (args.run_dir / "run_job.json").write_text("{}")
+    with pytest.raises(ValueError, match="files have changed"):
+        batch.main(argv)
+    assert len([c for c in calls if "submit" in c]) == 1
+    with pytest.raises(ValueError, match="layout differs"):
+        batch.main(["qualify", *argv[1:]])
+
+
+@pytest.mark.parametrize("final,status,scientific,smoke_done,sync_exit,markers", [
+    (False, "complete", True, True, 0, []),
+    (True, "failed", False, False, 0, []),
+    (True, "inconclusive_qualification", False, True, 0, ["smoke/analysis/SUCCESS.json"]),
+    (True, "complete", False, True, 0, ["smoke/analysis/SUCCESS.json"]),
+    (True, "complete", True, True, 0, ["smoke/analysis/SUCCESS.json", "analysis/SUCCESS.json"]),
+    (True, "complete", True, True, 1, []),
+])
+def test_success_markers_published_only_after_final_sync(tmp_path, final, status, scientific,
+                                                       smoke_done, sync_exit, markers):
+    for name in ("analysis", "smoke/analysis"):
+        (tmp_path / name).mkdir(parents=True)
+        (tmp_path / name / "SUCCESS.json").write_text("{}")
+    (tmp_path / "STATUS.json").write_text(json.dumps(dict(
+        status=status, scientific_complete=scientific,
+        completed_stages=["smoke/aggregate"] if smoke_done else [])))
+    # Stub only external commands; exercise the generated Bash function and its
+    # actual Python publication guard. This test makes no GCS writes.
+    script = f'''set -Eeuo pipefail
+WORK={shlex.quote(str(tmp_path))}
+OUTPUT="$WORK"
+FHP_DESTINATION=gs://test/exp21
+flock() {{ shift 3; "$@"; }}
+timeout() {{ shift; "$@"; }}
+gcloud() {{
+  printf '%s\\n' "$*" >> "$WORK/calls.txt"
+  if [[ "$2" == rsync ]]; then return {sync_exit}; fi
+}}
+''' + batch.pipeline_upload_function() + f"\nsync_outputs {int(final)}\n"
+    run = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+    assert (run.returncode == 0) == (sync_exit == 0), run.stderr
+    calls = (tmp_path / "calls.txt").read_text().splitlines()
+    assert len(calls) == 1 + len(markers)
+    for call, marker in zip(calls[1:], markers):
+        assert call.endswith(f"gs://test/exp21/{marker}")

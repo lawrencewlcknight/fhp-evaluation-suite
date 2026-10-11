@@ -57,15 +57,20 @@ No repeated testing until significance and no optional early stopping. This is
 evidence of a useful attacker, **not** evidence of a close-to-optimal response.
 Failure means *inconclusive, stop and review*, not proof that the source is safe.
 
-The three-seed repair submission requires every source seed to pass. A successful
-Batch qualification job can still report `gate_passed: false`; it completed the
-measurement, not the scientific gate. Execution-only smoke can exercise later
-stages but is explicitly barred from qualifying a production run.
+The three-seed repair phase requires every source seed to pass. In the one-job
+workflow, an inconclusive gate stops the job before full training: pipeline
+`STATUS.json` reports `inconclusive_qualification`, and Batch reports `FAILED`.
+For legacy separate-stage jobs, a successful qualification job can still report
+`gate_passed: false`; it completed the measurement, not the scientific gate.
+Execution-only smoke can exercise later stages but is explicitly barred from
+qualifying a production run.
 
 Historical Exp10 states are approximately 5.4 GB monolithic files. Qualification
 downloads and verifies one per source seed, extracts only policy replay and saves
-a hashed grouped cache. Training reuses this cache; evaluation downloads policies
-only. No critic training or full-game traversal is performed.
+a hashed grouped cache. Training reuses this cache; evaluation needs policies
+only. The one-job workflow reuses the local verified source inputs across phases,
+with separate smoke/full input directories. No critic training or full-game
+traversal is performed.
 
 ## Stage 2: fixed-budget policy repair
 
@@ -133,17 +138,31 @@ effects may need more deals, more source seeds and attacker-training repetitions
 
 ## Cost, jobs and diagnostics
 
-Qualification and training: three concurrent `n2-standard-16` tasks, one per
-source seed. Each uses two Torch threads, batching but **not Ray**. Qualification
-has a two-hour process ceiling. Training has a 14-hour process ceiling; nominal
-adversarial work is 3.25 hours per updated adversarial arm, plus the generous
-ordinary-fitting control. Evaluation has 12 concurrent `n2-standard-4` tasks,
-each with a six-hour process ceiling. Both main arrays need 48 regional N2 vCPUs.
-Aggregation uses one `n2-standard-4` VM. Limits exclude separately bounded setup
-and final upload. Budget ~12–24 elapsed hours across sequential stages if gates
-pass; this is not a throughput guarantee, and billed VM-hours sum across tasks.
+The recommended `run` action submits one Batch task on a single
+`n2-standard-48` VM with a 200-GB balanced boot disk and zero automatic retries.
+It runs all four execution-smoke phases, then full qualification, training,
+evaluation and aggregation, with a barrier after every phase. No cloud controller
+or child jobs are submitted; the laptop is not needed after submission.
 
-Each phase has a process-tree RSS/wall-time watchdog, streamed stdout/stderr,
+Qualification and training retain three concurrent workers, one per source seed.
+Each uses two Torch threads, batching but **not Ray**. Qualification has a two-hour
+process ceiling. Training has a 14-hour process ceiling; nominal adversarial work
+is 3.25 hours per updated adversarial arm, plus the generous ordinary-fitting
+control. Evaluation retains 12 concurrent workers, each with a six-hour process
+ceiling and two Torch threads. Aggregation has a 15-minute ceiling. Every smoke
+worker has a 15-minute ceiling. RSS caps remain 56,000 MiB per qualification/
+training worker and 13,000 MiB per evaluation/aggregation worker.
+
+The entire Batch task has a **26-hour cap**, including separately bounded setup
+and final upload. Budget ~12–24 elapsed hours plus provisioning if gates pass;
+this is a planning estimate, not a benchmark of this combined job or a throughput
+guarantee. All 48 vCPUs stay allocated during smoke, aggregation and phase tails,
+so billed VM time does not scale down between phases. The scientific budgets and
+worker concurrency are unchanged. The legacy separate-stage implementation still
+uses three `n2-standard-16` qualification/training VMs, twelve `n2-standard-4`
+evaluation VMs and one `n2-standard-4` aggregation VM.
+
+Each worker has a process-tree RSS/wall-time watchdog, recorded stdout/stderr,
 10-second training progress, periodic cloud uploads and an independent final
 upload runnable. On OOM/time limit/error, partial files remain diagnostic-only;
 failed stages cannot unlock the next phase. Cloud Logging and final cgroup/kernel
@@ -159,8 +178,50 @@ for untrusted files). Preparing or submitting never requires a GitHub login.
 
 Have `PROJECT_ID`, `REGION`, `BUCKET`, `SA_EMAIL` and an up-to-date sibling
 `fhp-evaluation-suite` checkout. Optionally set `FHP_EVAL_REPO` explicitly.
-No job is submitted by `prepare`; subsequent stages each require an explicit
-command. Keep the prepared directory unchanged.
+Use a fresh run ID and one command for the entire sequence:
+
+```bash
+export RUN_ID="exp21-adv-full-$(date -u +%Y%m%d-%H%M%S)"
+unset FHP_BATCH_OUTPUT_DIR
+bash gcp/run_exp21_adversarial_preservation.sh run
+```
+
+`run` creates the immutable source bundle and `run_job.json` under
+`outputs/batch/$RUN_ID`, checks that the cloud destination and job name are unused,
+uploads inputs and submits `$RUN_ID-run`. Keep this directory unchanged. No push,
+`REPO_REF`, `SMOKE_RUN_ID` or subsequent submission is required. The integrated
+smoke exercises qualification, repair, all four evaluation arms and aggregation
+with the identical bundle before any full work starts. The old qualification-only
+smoke is not a substitute. Source bundling includes local edits in both checkouts.
+
+Optional: `prepare-run` creates that bundle offline, then `run` with the same ID
+submits it. `run-smoke` on a fresh ID runs only the integrated smoke (not scientific
+qualification). These actions are not interchangeable with old separately
+prepared runs. A new run ID is required for a new bundle; no automatic resume or
+retries are implemented.
+
+```bash
+bash gcp/run_exp21_adversarial_preservation.sh status
+gcloud storage cat "$BUCKET/$RUN_ID/STATUS.json"
+```
+
+`STATUS.json` appears after bootstrap and is periodically uploaded; it records
+mode, phase, completed tasks/stages and failure details. A full result requires
+Batch `SUCCEEDED`, `STATUS.json` with `scientific_complete: true`, and
+`analysis/SUCCESS.json`. Overall success markers are excluded from periodic
+uploads and published only after a successful final sync. Smoke analysis is
+isolated under `smoke/analysis`; full aggregate analysis remains under `analysis/`.
+Failure cancels other active workers in that phase and never starts successors.
+If an attacker-strength gate fails, stop and review rather than repeatedly testing
+under new IDs. This is an inconclusive scientific qualification, not a software
+failure or evidence of low exploitability.
+
+## Legacy separately submitted phases
+
+The following workflow remains supported for existing separately prepared runs.
+It is **not needed** for the recommended single-job workflow above.
+No job is submitted by legacy `prepare`; subsequent stages each require an
+explicit command. Keep the prepared directory unchanged.
 
 ```bash
 export RUN_ID="exp21-adv-smoke-$(date -u +%Y%m%d-%H%M%S)"
@@ -206,6 +267,8 @@ bash gcp/run_exp21_adversarial_preservation.sh aggregate
 Every stage refuses an occupied output namespace and has zero automatic retries.
 An inconclusive qualification should prompt analysis, not repeated reruns under
 new IDs until a gate passes. A failed stage needs diagnosis before a new attempt.
+
+## Downloading results (either workflow)
 
 ```bash
 mkdir -p "cloud_outputs/$RUN_ID/analysis"

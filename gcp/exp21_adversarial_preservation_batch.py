@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Source-bundled, explicitly cost-gated UCV Experiment 21 (no automatic launches)."""
+"""Source-bundled Exp21: one-job pipeline or legacy separately gated stages."""
 
 import argparse
 import json
@@ -138,6 +138,68 @@ def build_job(args, bundle, stage):
         logsPolicy=dict(destination="CLOUD_LOGGING"), labels=dict(experiment="exp21-adversarial", stage=stage))
 
 
+def pipeline_upload_function():
+    # Never publish the overall success marker from a periodic/partial upload.
+    # Final publication follows a successful full sync after the workers stop.
+    return '''sync_outputs() {
+  flock -w 600 "$WORK/upload.lock" timeout 900 gcloud storage rsync --recursive \\
+    --exclude='.*[.]tmp([.]npz)?$|^(analysis|smoke/analysis)/SUCCESS[.]json$' \\
+    "$OUTPUT" "$FHP_DESTINATION" || return 1
+  if [[ "${1:-0}" == 1 && -f "$OUTPUT/STATUS.json" ]]; then
+    for marker in smoke/analysis/SUCCESS.json analysis/SUCCESS.json; do
+      if [[ -f "$OUTPUT/$marker" ]] && /usr/bin/python3 -c 'import json,sys; s=json.load(open(sys.argv[1])); ok=("smoke/aggregate" in s.get("completed_stages",[])) if sys.argv[2].startswith("smoke/") else (s.get("status")=="complete" and s.get("scientific_complete") is True); sys.exit(0 if ok else 1)' "$OUTPUT/STATUS.json" "$marker"; then
+        timeout 120 gcloud storage cp "$OUTPUT/$marker" "$FHP_DESTINATION/$marker" || return 1
+      fi
+    done
+  fi
+}
+'''
+
+
+def build_pipeline_job(args, bundle):
+    """One task/VM, no Batch submissions from inside the job."""
+    job = build_job(args, bundle, "qualify")
+    script = main_script("qualify").split("ARGS=()\n", 1)[0]
+    script = script.replace(task_setup("qualify"), "")
+    start, end = script.index("sync_outputs() {"), script.index("cleanup() {")
+    script = script[:start] + pipeline_upload_function() + script[end:]
+    script += '''ARGS=()
+if [[ "$FHP_SMOKE" == 1 ]]; then ARGS+=(--smoke-only); fi
+stage sequential_pipeline
+timeout --signal=TERM --kill-after=30 90000 "$PYTHON" -m fhp_evaluation.adversarial.pipeline run \\
+  --output "$OUTPUT" --inputs "$WORK/input" --native-repo "$WORK/source/native" \\
+  --bucket "$FHP_SOURCE_BUCKET" "${ARGS[@]}"
+stage final_publication
+sync_outputs 1
+stage complete
+'''
+    final = '''#!/usr/bin/env bash
+set -Eeuo pipefail
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
+WORK=/workspace/fhp-exp21
+OUTPUT="$WORK/output"
+mkdir -p "$OUTPUT"
+{
+  date -u
+  free -m || true
+  df -h /workspace || true
+  if [[ -r /sys/fs/cgroup/memory.events ]]; then cat /sys/fs/cgroup/memory.events; fi
+  dmesg 2>&1 | tail -80 || true
+} > "$OUTPUT/final_system_diagnostics.txt"
+''' + pipeline_upload_function() + '\nsync_outputs 1\n'
+    group = job["taskGroups"][0]
+    group.update(taskCount=1, parallelism=1)
+    spec = group["taskSpec"]
+    spec["computeResource"] = dict(cpuMilli=48000, memoryMib=180000)
+    spec["maxRunDuration"] = "93600s"  # 26 hours, including setup/final upload.
+    spec["runnables"] = [dict(displayName="sequential-pipeline", timeout="91800s", script=dict(text=script)),
+                         dict(displayName="final-upload", alwaysRun=True, timeout="1800s", script=dict(text=final))]
+    policy = job["allocationPolicy"]["instances"][0]["policy"]
+    policy.update(machineType="n2-standard-48", bootDisk=dict(sizeGb=200, type="pd-balanced"))
+    job["labels"].update(stage="run", mode="smoke" if args.smoke else "full")
+    return job
+
+
 def remote_json(uri):
     return json.loads(read("gcloud", "storage", "cat", uri))
 
@@ -153,7 +215,7 @@ def preflight(args, request, stage):
     base = f"{args.bucket}/{args.run_id}"
     read("gcloud", "iam", "service-accounts", "describe", args.service_account,
          "--project", args.project, "--format=value(email)")
-    prefix = base if stage == "qualify" else f"{base}/{'analysis' if stage == 'aggregate' else stage}"
+    prefix = base if stage in ("qualify", "run") else f"{base}/{'analysis' if stage == 'aggregate' else stage}"
     listing = json.loads(read("gcloud", "storage", "objects", "list", f"{prefix}/**",
                              "--exhaustive", "--limit=1", "--format=json"))
     if not isinstance(listing, list) or listing:
@@ -162,6 +224,10 @@ def preflight(args, request, stage):
                      "--location", args.region, "--filter", f"name:{args.run_id}-{stage}", "--format=json"))
     if not isinstance(jobs, list) or jobs:
         raise ValueError("Job name already used")
+    if stage == "run":
+        # The same immutable bundle executes all four smoke phases inside this
+        # job before full qualification; historical partial smoke is not reused.
+        return
     if stage == "qualify":
         if not args.smoke:
             if not re.fullmatch(r"exp21-adv-[a-z0-9-]+", args.smoke_run_id or ""):
@@ -192,9 +258,30 @@ def preflight(args, request, stage):
                 raise ValueError(f"Seed {task} failed attacker qualification. Stop and review; no repair submitted.")
 
 
+def prepare(args, *, pipeline=False):
+    args.run_dir.mkdir(parents=True, exist_ok=False)
+    bundle = args.run_dir / "source.tar.gz"
+    provenance = make_bundle(ROOT, args.native_repo, bundle, extra_files=(
+        "gcp/exp21_adversarial_preservation_batch.py", "gcp/run_exp4_ucv_exp9_br_pilot.sh",
+        "gcp/finalize_exp4_ucv_exp9_br_pilot.sh"))
+    digest = sha256(bundle)
+    stages = ("run",) if pipeline else STAGES
+    for stage in stages:
+        job = build_pipeline_job(args, digest) if pipeline else build_job(args, digest, stage)
+        (args.run_dir / f"{stage}_job.json").write_text(json.dumps(job, indent=2) + "\n")
+    files = ["source.tar.gz", *(f"{s}_job.json" for s in stages)]
+    request = dict(run_id=args.run_id, project=args.project, region=args.region, bucket=args.bucket,
+                   service_account=args.service_account, smoke=args.smoke, source=provenance,
+                   bundle_sha256=digest, files={name: sha256(args.run_dir / name) for name in files})
+    if pipeline:
+        request["layout"] = "single_job_v1"
+    (args.run_dir / "request.json").write_text(json.dumps(request, indent=2) + "\n")
+    print(f"Prepared {args.run_dir}; no cloud calls or jobs submitted.")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("prepare", *STAGES))
+    parser.add_argument("action", choices=("prepare-run", "run", "prepare", *STAGES))
     for name, env in (("project", "PROJECT_ID"), ("region", "REGION"), ("bucket", "BUCKET"),
                       ("service-account", "SA_EMAIL"), ("run-id", "RUN_ID"), ("smoke-run-id", "SMOKE_RUN_ID")):
         parser.add_argument("--" + name, default=os.environ.get(env))
@@ -203,23 +290,14 @@ def main(argv=None):
     parser.add_argument("--smoke", action="store_true")
     args = parser.parse_args(argv)
     validate(args)
-    if args.action == "prepare":
-        args.run_dir.mkdir(parents=True, exist_ok=False)
-        bundle = args.run_dir / "source.tar.gz"
-        provenance = make_bundle(ROOT, args.native_repo, bundle, extra_files=(
-            "gcp/exp21_adversarial_preservation_batch.py", "gcp/run_exp4_ucv_exp9_br_pilot.sh",
-            "gcp/finalize_exp4_ucv_exp9_br_pilot.sh"))
-        digest = sha256(bundle)
-        for stage in STAGES:
-            (args.run_dir / f"{stage}_job.json").write_text(json.dumps(build_job(args, digest, stage), indent=2) + "\n")
-        files = ["source.tar.gz", *(f"{s}_job.json" for s in STAGES)]
-        request = dict(run_id=args.run_id, project=args.project, region=args.region, bucket=args.bucket,
-                       service_account=args.service_account, smoke=args.smoke, source=provenance,
-                       bundle_sha256=digest, files={name: sha256(args.run_dir / name) for name in files})
-        (args.run_dir / "request.json").write_text(json.dumps(request, indent=2) + "\n")
-        print(f"Prepared {args.run_dir}; no cloud calls or jobs submitted.")
+    if args.action in ("prepare", "prepare-run"):
+        prepare(args, pipeline=args.action == "prepare-run")
         return
+    if args.action == "run" and not args.run_dir.exists():
+        prepare(args, pipeline=True)
     request = json.loads((args.run_dir / "request.json").read_text())
+    if (args.action == "run") != (request.get("layout") == "single_job_v1"):
+        raise ValueError("Prepared layout differs; choose a fresh RUN_ID for the single-job workflow")
     for key in ("run_id", "project", "region", "bucket", "service_account", "smoke"):
         if request[key] != getattr(args, key):
             raise ValueError(f"Prepared request differs: {key}")
@@ -227,14 +305,18 @@ def main(argv=None):
         if sha256(args.run_dir / name) != digest:
             raise ValueError("Prepared files have changed; prepare a new run")
     preflight(args, request, args.action)
-    if args.action == "qualify":
+    if args.action in ("qualify", "run"):
         for name in (*request["files"], "request.json"):
             subprocess.run(["gcloud", "storage", "cp", "--if-generation-match=0", str(args.run_dir / name),
                             f"{args.bucket}/{args.run_id}/inputs/{name}"], check=True, timeout=300)
     subprocess.run(["gcloud", "batch", "jobs", "submit", f"{args.run_id}-{args.action}",
                     "--project", args.project, "--location", args.region,
                     "--config", str(args.run_dir / f"{args.action}_job.json")], check=True, timeout=180)
-    print(f"Submitted {args.run_id}-{args.action}. No later phase is automatically launched.")
+    if args.action == "run":
+        print(f"Submitted {args.run_id}-run. One job runs integrated smoke and all permitted phases; "
+              "no further submissions or laptop connection are needed.")
+    else:
+        print(f"Submitted {args.run_id}-{args.action}. No later phase is automatically launched.")
 
 
 if __name__ == "__main__":
