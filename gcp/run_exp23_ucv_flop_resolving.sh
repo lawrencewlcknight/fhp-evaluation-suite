@@ -3,6 +3,8 @@
 set -Eeuo pipefail
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
 export DEBIAN_FRONTEND=noninteractive
+: "${FHP_SEARCH_MODE:?Prepared bundle must specify gameplay or feasibility mode}"
+case "$FHP_SEARCH_MODE" in gameplay|feasibility) ;; *) echo 'Invalid search mode' >&2; exit 2 ;; esac
 export FHP_SEARCH_WORK=/workspace/fhp-resolving-exp23
 OUTPUT="$FHP_SEARCH_WORK/output"
 mkdir -p "$OUTPUT" "$FHP_SEARCH_WORK/source" "$FHP_SEARCH_WORK/input"
@@ -56,10 +58,10 @@ export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 VECLIB_MAXIMUM
 "$FHP_SEARCH_WORK/venv/bin/python" - <<'DOWNLOAD'
 import json, os, subprocess
 from pathlib import Path
-from fhp_evaluation.resolving.experiment import checkpoint_registry
+from fhp_evaluation.resolving.experiment import required_sources
 from fhp_evaluation.loaders import sha256_file
 work = Path(os.environ["FHP_SEARCH_WORK"])
-sources = checkpoint_registry()
+sources = required_sources(os.environ['FHP_SEARCH_MODE'])
 for name, record in sources.items():
     uri = f"{os.environ['FHP_SOURCE_BUCKET']}/{record['run']}/{record['relative']}"
     target = work / "input" / f"{name}.pkl"
@@ -68,6 +70,12 @@ for name, record in sources.items():
         raise ValueError(f"Checkpoint checksum mismatch: {name}")
 (work / "output/checkpoint_sources.json").write_text(json.dumps(sources, indent=2))
 DOWNLOAD
-timeout --signal=TERM --kill-after=60 166000 "$FHP_SEARCH_WORK/venv/bin/python" \
+EXTRA_ARGS=()
+SEARCH_TIMEOUT=166000
+if [[ "$FHP_SEARCH_MODE" == feasibility ]]; then
+  EXTRA_ARGS+=(--preflight-only)
+  SEARCH_TIMEOUT=600
+fi
+timeout --signal=TERM --kill-after=60 "$SEARCH_TIMEOUT" "$FHP_SEARCH_WORK/venv/bin/python" \
   -m fhp_evaluation.resolving.runner --input-root "$FHP_SEARCH_WORK/input" \
-  --native-root "$FHP_SEARCH_WORK/source/native" --output "$OUTPUT"
+  --native-root "$FHP_SEARCH_WORK/source/native" --output "$OUTPUT" "${EXTRA_ARGS[@]}"

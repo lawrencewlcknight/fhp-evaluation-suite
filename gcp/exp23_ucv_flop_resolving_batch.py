@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 configuration_spec = importlib.util.spec_from_file_location("exp23_config", ROOT / "fhp_evaluation/resolving/experiment.py")
 configuration = importlib.util.module_from_spec(configuration_spec)
 configuration_spec.loader.exec_module(configuration)
-config, checkpoint_registry = configuration.config, configuration.checkpoint_registry
+config, required_sources = configuration.config, configuration.required_sources
 
 spec = importlib.util.spec_from_file_location("bundle_common", ROOT / "gcp/exp5_ucv_exp9_br_production_batch.py")
 common = importlib.util.module_from_spec(spec)
@@ -22,6 +22,8 @@ EXTRA_FILES = ("gcp/exp23_ucv_flop_resolving_batch.py", "gcp/run_exp23_ucv_flop_
 
 
 def validate(args):
+    if args.mode not in ("gameplay", "feasibility"):
+        raise ValueError("EXP23_MODE must be gameplay or feasibility")
     if not re.fullmatch(r"exp23-search-[a-z0-9][a-z0-9-]{0,28}", args.run_id or ""):
         raise ValueError("Use a fresh exp23-search-* RUN_ID (at most 42 characters)")
     if not re.fullmatch(r"[a-z][a-z0-9-]{4,61}[a-z0-9]", args.project or ""):
@@ -41,13 +43,13 @@ def validate(args):
 def build_job(args, bundle_hash):
     destination = f"{args.bucket}/{args.run_id}"
     env = dict(FHP_BUNDLE_URI=f"{destination}/inputs/source.tar.gz", FHP_BUNDLE_SHA256=bundle_hash,
-               FHP_DESTINATION=destination, FHP_SOURCE_BUCKET=args.bucket,
+               FHP_DESTINATION=destination, FHP_SOURCE_BUCKET=args.bucket, FHP_SEARCH_MODE=args.mode,
                PYTHONUNBUFFERED="1", PYTHONFAULTHANDLER="1", PYTHONDONTWRITEBYTECODE="1",
                CUDA_VISIBLE_DEVICES="")
     return dict(taskGroups=[dict(taskCount=1, parallelism=1, taskCountPerNode=1, taskSpec=dict(
         computeResource=dict(cpuMilli=16000, memoryMib=56000), maxRetryCount=0,
-        maxRunDuration="172800s", environment=dict(variables=env), runnables=[
-            dict(displayName="paired-search-gameplay", timeout="171600s",
+        maxRunDuration="3600s" if args.mode == "feasibility" else "172800s", environment=dict(variables=env), runnables=[
+            dict(displayName="search-" + args.mode, timeout="2700s" if args.mode == "feasibility" else "171600s",
                  script=dict(text=(ROOT / EXTRA_FILES[1]).read_text())),
             dict(displayName="final-upload", alwaysRun=True, timeout="900s",
                  script=dict(text=(ROOT / EXTRA_FILES[2]).read_text()))]))],
@@ -82,7 +84,7 @@ def preflight(args, request, job_id):
         old = json.loads(read("gcloud", "storage", "cat", f"{args.bucket}/{args.run_id}/inputs/request.json"))
         if old != request or any(r.get("status", {}).get("state") == "SUCCEEDED" for r in jobs):
             raise ValueError("Recovery must match the immutable failed run, not a completed run")
-    for record in checkpoint_registry().values():
+    for record in required_sources(args.mode).values():
         uri = f"{args.bucket}/{record['run']}/{record['relative']}"
         meta = json.loads(read("gcloud", "storage", "objects", "describe", uri, "--format=json"))
         if not 0 < int(meta.get("size", meta.get("sizeBytes", 0))) <= 256 * 1024**2:
@@ -97,13 +99,14 @@ def main():
     parser.add_argument("--bucket", default=os.environ.get("BUCKET"))
     parser.add_argument("--service-account", default=os.environ.get("SA_EMAIL"))
     parser.add_argument("--run-id", default=os.environ.get("RUN_ID"))
+    parser.add_argument("--mode", choices=("gameplay", "feasibility"), default=os.environ.get("EXP23_MODE", "gameplay"))
     parser.add_argument("--native-repo", type=Path, default=ROOT.parent / "fhp_ucv_escher/fhp-ucv-escher-experiments")
     parser.add_argument("--run-dir", type=Path)
     parser.add_argument("--recovery-tag")
     args = parser.parse_args()
     validate(args)
     directory = args.run_dir or ROOT / "outputs/batch" / args.run_id
-    fields = ("project", "region", "bucket", "service_account", "run_id")
+    fields = ("project", "region", "bucket", "service_account", "run_id", "mode")
     if args.action == "prepare":
         directory.mkdir(parents=True, exist_ok=False)
         source = common.make_bundle(ROOT, args.native_repo, directory / "source.tar.gz", extra_files=EXTRA_FILES)
@@ -116,8 +119,9 @@ def main():
         print(f"Prepared {directory}; no cloud calls or paid jobs. Source is bundled by hash, not REPO_REF.")
         return
     request = json.loads((directory / "request.json").read_text())
-    if any(request[f] != getattr(args, f) for f in fields):
-        raise ValueError("Arguments differ from the prepared request")
+    if any(request.get(f) != getattr(args, f) for f in fields):
+        raise ValueError("Arguments differ from the prepared request (including mode); "
+                         "old bundles require a fresh run ID and preparation with the updated source")
     for name, sha in request["prepared_files_sha256"].items():
         if common.sha256(directory / name) != sha:
             raise ValueError(f"Prepared input changed: {name}")
@@ -128,7 +132,7 @@ def main():
     else:
         if args.recovery_tag:
             raise ValueError("Recovery tags only apply to recover")
-        suffix = "evaluate"
+        suffix = "feasibility" if args.mode == "feasibility" else "evaluate"
     job_id = args.run_id + "-" + suffix
     preflight(args, request, job_id)
     if args.action == "submit":
@@ -137,7 +141,9 @@ def main():
                             f"{args.bucket}/{args.run_id}/inputs/{name}"], check=True, timeout=300)
     subprocess.run(["gcloud", "batch", "jobs", "submit", job_id, "--project", args.project,
                     "--location", args.region, "--config", str(directory / "job.json")], check=True, timeout=180)
-    print(f"Submitted {job_id}. One VM runs checks then gameplay automatically. No training.")
+    print(f"Submitted {job_id}. Mode: {args.mode}. " + (
+        "Profiling and timed probes only; no gameplay/training." if args.mode == "feasibility" else
+        "One VM runs checks then gameplay automatically. No training."))
 
 
 if __name__ == "__main__":

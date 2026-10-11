@@ -178,6 +178,7 @@ def test_native_production_network_and_stdlib_cloud_prepare(tmp_path):
     assert proc.returncode == 0, proc.stdout + proc.stderr
     checks = json.loads((tmp_path / "native_probe.json").read_text())
     assert checks["passed"] and checks["preflop_full_range_max_error"] < 1e-7
+    assert checks["bitwise_feature_rows"] == 19116
     output = tmp_path / "batch"
     proc = subprocess.run([sys.executable, "-S", str(root / "gcp/exp23_ucv_flop_resolving_batch.py"),
                            "prepare", "--project", "clever-overview-399515", "--region", "europe-west1",
@@ -193,3 +194,88 @@ def test_native_production_network_and_stdlib_cloud_prepare(tmp_path):
     assert len(request["experiment"]["checkpoint_registry"]) == 9
     assert request["source"]["source_only"]
     assert (output / "source.tar.gz").stat().st_size < 16 * 1024**2
+
+
+def test_vector_card_frame_validation():
+    from fhp_evaluation.resolving.features import card_frames
+    for hands, board in (([[0, 0]], ()), ([[0, 52]], ()), ([[0, 4]], (0, 8, 12)),
+                         ([[0, 4]], (8, 8, 12)), ([[0, 4]], (8,)), ([[0., 4.]], ())):
+        with pytest.raises(ValueError):
+            card_frames(hands, board)
+
+
+def test_diagnostic_stage_timings(small):
+    from fhp_evaluation.resolving.runner import timing_summary
+    target = PolicyAdapter(FixedPolicy(small))
+    _, _, stats = solve(small, target, (0, 3, 6), (1, 1), 0, seconds=None, iterations=2)
+    assert all(x >= 0 for x in stats['stage_seconds'].values())
+    assert {'hand_space', 'public_tree', 'solver_iterations', 'candidate_verification'} <= stats['stage_seconds'].keys()
+    summary = timing_summary([dict(stats, total_seconds=stats['elapsed_seconds'], budget_seconds=10)])
+    assert summary['preparation_completed'] == 1
+    assert summary['mean_stage_seconds'] == stats['stage_seconds']
+
+
+def test_feasibility_mode_stops_before_gameplay(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+    from fhp_evaluation.resolving import runner
+    from fhp_evaluation.resolving.experiment import required_sources
+    sources = required_sources('feasibility')
+    assert len(sources) == 3 and len(required_sources('gameplay')) == 9
+    monkeypatch.setattr(runner, 'sha256', lambda path: sources[path.stem]['sha256'])
+    monkeypatch.setattr(runner, 'algebra_checks', lambda: {'passed': True})
+    calls = []
+    class Pool:
+        def map(self, fn, positions, *rest):
+            positions = list(positions)
+            calls.append((fn.__name__, len(positions)))
+            if fn == runner.parity_task:
+                return [{'passed': True} for _ in positions]
+            if fn == runner.profile_task:
+                return [{'passed': True} for _ in positions]
+            assert fn == runner.preflight_task
+            return [dict(seed=seed, accepted=True, total_seconds=.4, budget_seconds=.5,
+                         iterations=20, reason='verified', preparation_completed=True)
+                    for seed, index in positions]
+        def submit(self, *args, **kwargs):
+            raise AssertionError('Feasibility mode must not submit gameplay')
+    @contextmanager
+    def pool(spec):
+        yield Pool()
+    monkeypatch.setattr(runner, 'worker_pool', pool)
+    output = tmp_path / 'output'
+    runner.execute(tmp_path, tmp_path, output, preflight_only=True)
+    assert calls == [('parity_task', 3), ('profile_task', 9), ('preflight_task', 72)]
+    assert (output / 'analysis/FEASIBILITY_SUCCESS.json').is_file()
+    assert not (output / 'analysis/SUCCESS.json').exists()
+    assert not (output / 'analysis/task_results').exists()
+    with pytest.raises(ValueError, match='Already completed'):
+        runner.execute(tmp_path, tmp_path, output, preflight_only=True)
+    # A failed gate is still a failed feasibility job, never a silently passed pilot.
+    monkeypatch.setattr(runner, 'enforce_gate', lambda *args: (_ for _ in ()).throw(RuntimeError('test gate')))
+    with pytest.raises(RuntimeError, match='Seed 0'):
+        runner.execute(tmp_path, tmp_path, tmp_path / 'failed', preflight_only=True)
+    assert not (tmp_path / 'failed/analysis/FEASIBILITY_SUCCESS.json').exists()
+    assert (tmp_path / 'failed/analysis/preflight.json').is_file()
+
+
+def test_stdlib_feasibility_bundle(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    native = root.parent / 'fhp_ucv_escher/fhp-ucv-escher-experiments'
+    if not (native / 'fhp_escher/checkpointing.py').is_file():
+        pytest.skip('Native checkout not installed')
+    proc = subprocess.run([sys.executable, '-S', str(root / 'gcp/exp23_ucv_flop_resolving_batch.py'),
+                           'prepare', '--mode', 'feasibility', '--project', 'clever-overview-399515',
+                           '--region', 'europe-west1', '--bucket', 'gs://clever-overview-399515-fhp-escher-results',
+                           '--service-account', 'fhp-escher-runner@clever-overview-399515.iam.gserviceaccount.com',
+                           '--run-id', 'exp23-search-feasibility-test', '--native-repo', str(native),
+                           '--run-dir', str(tmp_path / 'batch')], capture_output=True, text=True, timeout=30)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    request = json.loads((tmp_path / 'batch/request.json').read_text())
+    job = json.loads((tmp_path / 'batch/job.json').read_text())
+    assert request['mode'] == 'feasibility'
+    task = job['taskGroups'][0]['taskSpec']
+    assert task['maxRunDuration'] == '3600s'
+    assert task['environment']['variables']['FHP_SEARCH_MODE'] == 'feasibility'
+    assert '--preflight-only' in task['runnables'][0]['script']['text']
+    assert request['experiment']['search_seconds'] == .5
+    assert request['experiment']['minimum_acceptance_rate'] == .1

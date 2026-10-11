@@ -50,6 +50,13 @@ def config():
                 warning="Local numerical BR certificates are not whole-game exploitability measurements.")
 
 
+def required_sources(mode):
+    if mode not in ("gameplay", "feasibility"):
+        raise ValueError("Expected gameplay or feasibility mode")
+    return {k: v for k, v in checkpoint_registry().items()
+            if mode == "gameplay" or k.startswith("exp16_")}
+
+
 def tasks(spec=None):
     spec = config() if spec is None else spec
     rows = []

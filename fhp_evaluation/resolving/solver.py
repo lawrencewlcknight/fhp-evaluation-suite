@@ -7,6 +7,7 @@ for EACH opponent root hand, with the unchanged hero preflop counterfactual
 reach. This is a local numerical certificate, not measured whole-game NashConv.
 """
 from dataclasses import dataclass
+from contextlib import contextmanager
 import time
 
 import numpy as np
@@ -26,6 +27,15 @@ class Deadline:
         self.clock = clock
         self.start = clock()
         self.end = float("inf") if seconds is None else self.start + seconds
+        self.timings = {}
+
+    @contextmanager
+    def measure(self, name):
+        started = self.clock()
+        try:
+            yield
+        finally:
+            self.timings[name] = self.timings.get(name, 0.) + self.clock() - started
 
     def check(self):
         if self.clock() >= self.end:
@@ -41,17 +51,20 @@ class Problem:
     blueprint: dict
 
 
-def prepare(game, adapter, board, pre, hero, deadline):
+def prepare(game, adapter, board, pre, hero, deadline, *, query_implementation="vectorized"):
     deadline.check()
     deck = validate_game(game)
-    space = HandSpace(game, deck, board)
-    root = make_state(game, deck, space.hands[0], hero, board=board, preflop=pre)
-    nodes = compile_tree(root)
-    pre_nodes, entries = preflop_nodes(game)
+    with deadline.measure("hand_space"):
+        space = HandSpace(game, deck, board)
+    deadline.check()
+    with deadline.measure("public_tree"):
+        root = make_state(game, deck, space.hands[0], hero, board=board, preflop=pre)
+        nodes = compile_tree(root)
+        pre_nodes, entries = preflop_nodes(game)
     if pre not in entries or hero not in (0, 1):
         raise ValueError("Invalid public flop entry")
 
-    query = RangePolicyQuery(game, adapter, space, hero, deadline)
+    query = RangePolicyQuery(game, adapter, space, hero, deadline, implementation=query_implementation)
 
     reach = np.ones(len(space.hands))
     for i, a in enumerate(pre):
@@ -169,7 +182,8 @@ class Gadget:
                              where=v.sum(1)[:, None] > 0) for i, v in self.average.items()}
 
 
-def solve(game, adapter, board, pre, hero, *, seconds=.5, iterations=10000, clock=time.perf_counter):
+def solve(game, adapter, board, pre, hero, *, seconds=.5, iterations=10000, clock=time.perf_counter,
+          query_implementation="vectorized"):
     """Cold online work only. No board/solution cache is shared across hands.
 
     Cooperative deadline checks bound Python work; native kernels can overrun.
@@ -184,8 +198,10 @@ def solve(game, adapter, board, pre, hero, *, seconds=.5, iterations=10000, cloc
                  preparation_completed=False, rejected_checks=0, best_rejected_max_increase_bb=None,
                  max_increase_bb=0., mean_change_bb=0., strategy_change=0., reason="no_verified_improvement")
     try:
-        problem = prepare(game, adapter, tuple(board), tuple(pre), hero, deadline)
-        bound = response_values(problem, problem.blueprint, deadline)
+        problem = prepare(game, adapter, tuple(board), tuple(pre), hero, deadline,
+                          query_implementation=query_implementation)
+        with deadline.measure("blueprint_verification"):
+            bound = response_values(problem, problem.blueprint, deadline)
         stats["preparation_seconds"] = clock() - deadline.start
         stats["preparation_completed"] = True
         gadget = Gadget(problem, bound)
@@ -194,10 +210,12 @@ def solve(game, adapter, board, pre, hero, *, seconds=.5, iterations=10000, cloc
             if deadline.end - clock() < max(.002, 2 * last_step):
                 break
             started = clock()
-            gadget.step(deadline)
+            with deadline.measure("solver_iterations"):
+                gadget.step(deadline)
             stats["iterations"] = gadget.iteration
             candidate = gadget.strategy()
-            certificate = certify(problem, candidate, bound, deadline)
+            with deadline.measure("candidate_verification"):
+                certificate = certify(problem, candidate, bound, deadline)
             stats["checks"] += 1
             if not certificate["passed"]:
                 stats["rejected_checks"] += 1
@@ -216,11 +234,12 @@ def solve(game, adapter, board, pre, hero, *, seconds=.5, iterations=10000, cloc
         if result is None:
             stats["reason"] = "deadline"
     stats["elapsed_seconds"] = clock() - deadline.start
+    stats["stage_seconds"] = dict(deadline.timings)
     if not stats["preparation_completed"]:
         stats["preparation_seconds"] = stats["elapsed_seconds"]
     stats["overrun_seconds"] = max(0., stats["elapsed_seconds"] - seconds) if seconds is not None else 0.
     # A late result is never deployed, even if its strategy passed the certificate.
     if seconds is not None and stats["elapsed_seconds"] > seconds:
         result = None
-        stats.update(accepted=False, reason="deadline_overrun")
+        stats.update(accepted=False, reason="solver_deadline_overrun")
     return problem, result, stats

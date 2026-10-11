@@ -24,7 +24,7 @@ from ..game import load_fhp_game, MILLI_BIG_BLINDS_PER_CHIP
 from ..rule_agents import published_rule_agents
 from ..statistics import sample_summary
 from ..strategic_audit.tables import preflop_nodes
-from .experiment import config, source_hash, stream_seed, tasks
+from .experiment import config, source_hash, stream_seed, tasks, required_sources
 from .policy import ResolvingPolicy, play_hand
 from .validation import algebra_checks, native_checks
 
@@ -72,7 +72,11 @@ def timing_summary(traces):
         return dict(attempts=0, acceptance_rate=0., overrun_rate=0., maximum_seconds=0., reasons={})
     values = np.asarray([t["total_seconds"] for t in traces])
     decisions = sum(t.get("flop_decisions", 0) for t in traces)
+    stages = sorted({name for t in traces for name in t.get("stage_seconds", {})})
     return dict(attempts=len(traces), acceptance_rate=float(np.mean([t["accepted"] for t in traces])),
+                preparation_completed=sum(t.get("preparation_completed", False) for t in traces),
+                mean_preparation_seconds=float(np.mean([t.get("preparation_seconds", 0.) for t in traces])),
+                mean_stage_seconds={name: float(np.mean([t.get("stage_seconds", {}).get(name, 0.) for t in traces])) for name in stages},
                 flop_decisions=decisions,
                 changed_decision_rate=sum(t.get("changed_flop_decisions", 0) for t in traces) / decisions if decisions else None,
                 mean_decision_total_variation=sum(t.get("policy_total_variation_sum", 0.) for t in traces) / decisions if decisions else None,
@@ -110,6 +114,13 @@ def preflight_task(row, input_root, native_root, spec):
 def parity_task(seed, input_root, native_root, spec):
     game, adapter = load(f"exp16_seed{seed}_48h", input_root, native_root, json.dumps(spec, sort_keys=True))
     return dict(seed=seed, **native_checks(game, adapter))
+
+
+def profile_task(row, input_root, native_root, spec):
+    from .profiling import compare_preparation
+    seed, index = row
+    game, adapter = load(f"exp16_seed{seed}_48h", input_root, native_root, json.dumps(spec, sort_keys=True))
+    return compare_preparation(game, adapter, seed, index, spec)
 
 
 def deal_stream(spec, seed, opponent):
@@ -248,10 +259,11 @@ def execute(input_root, native_root, output, *, preflight_only=False):
     analysis.mkdir(parents=True, exist_ok=True)
     with (output / "run.lock").open("a") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        if (analysis / "SUCCESS.json").exists():
+        if any((analysis / name).exists() for name in ("SUCCESS.json", "FEASIBILITY_SUCCESS.json")):
             raise ValueError("Already completed; refusing to overwrite a completed experiment")
         runtime = {name: importlib.metadata.version(name) for name in ("numpy", "torch", "open_spiel", "scipy")}
         contract = dict(spec=spec, evaluator_source=source_hash(Path(__file__).resolve().parents[1]),
+                        mode="feasibility" if preflight_only else "gameplay",
                         native_source={name: source_hash(Path(native_root) / name) for name in ("fhp_escher", "vr_deep_cfr")},
                         runtime=runtime)
         identity = digest(contract)
@@ -261,7 +273,7 @@ def execute(input_root, native_root, output, *, preflight_only=False):
         write_json(manifest, contract)
         write_json(output / "status.json", dict(status="preflight", identity=identity))
         try:
-            for label, record in spec["checkpoint_registry"].items():
+            for label, record in required_sources(contract["mode"]).items():
                 if sha256(Path(input_root) / f"{label}.pkl") != record["sha256"]:
                     raise ValueError(f"Checkpoint mismatch: {label}")
             write_json(analysis / "algebra_checks.json", algebra_checks())
@@ -269,6 +281,14 @@ def execute(input_root, native_root, output, *, preflight_only=False):
                 parity = list(pool.map(parity_task, spec["training_seeds"],
                                        [input_root] * 3, [native_root] * 3, [spec] * 3))
                 write_json(analysis / "native_checks.json", parity)
+                if preflight_only:
+                    positions = [(seed, index) for index in range(3) for seed in spec["training_seeds"]]
+                    profiles = list(pool.map(profile_task, positions, [input_root] * len(positions),
+                                             [native_root] * len(positions), [spec] * len(positions)))
+                    write_json(analysis / "preparation_profile.json", dict(
+                        records=profiles, all_fixed_work_checks_passed=all(p["passed"] for p in profiles),
+                        note="Uncapped fixed-work profiling, not gameplay latency. Native feature caches disabled; "
+                             "legacy/vectorized order alternated. Gate below retains the unchanged 500ms budget."))
                 # Four concurrently loaded workers, as in gameplay. Rechecked on recovery.
                 checks = [(seed, index) for index in range(spec["preflight_positions_per_seed"])
                           for seed in spec["training_seeds"]]
@@ -277,9 +297,15 @@ def execute(input_root, native_root, output, *, preflight_only=False):
                 summaries = {str(seed): timing_summary([p for p in probes if p["seed"] == seed])
                              for seed in spec["training_seeds"]}
                 write_json(analysis / "preflight.json", dict(probes=probes, timing_by_seed=summaries))
-                for row in summaries.values():
-                    enforce_gate(row, spec)
+                for seed, row in summaries.items():
+                    try:
+                        enforce_gate(row, spec)
+                    except RuntimeError as exc:
+                        raise RuntimeError(f"Seed {seed}: accepted {row['acceptance_rate']:.1%}, "
+                                           f"overall deadline overruns {row['overrun_rate']:.1%}. {exc}") from exc
                 if preflight_only:
+                    write_json(analysis / "FEASIBILITY_SUCCESS.json", dict(status="preflight_passed", identity=identity,
+                                                                          gameplay_performed=False))
                     write_json(output / "status.json", dict(status="preflight_passed", identity=identity))
                     return
                 plan, results, pending = tasks(spec), [], {}
@@ -316,7 +342,7 @@ def main():
     parser.add_argument("--input-root", required=True)
     parser.add_argument("--native-root", required=True)
     parser.add_argument("--output", required=True)
-    parser.add_argument("--preflight-only", action="store_true", help="Debug integration only; production runs include this automatically")
+    parser.add_argument("--preflight-only", action="store_true", help="Fixed-work profiling and 72 timed probes only; never launch gameplay")
     args = parser.parse_args()
     execute(str(Path(args.input_root).resolve()), str(Path(args.native_root).resolve()),
             args.output, preflight_only=args.preflight_only)
