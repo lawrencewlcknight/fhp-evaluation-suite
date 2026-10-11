@@ -48,8 +48,8 @@ def build_job(args, bundle_hash):
                CUDA_VISIBLE_DEVICES="")
     return dict(taskGroups=[dict(taskCount=1, parallelism=1, taskCountPerNode=1, taskSpec=dict(
         computeResource=dict(cpuMilli=16000, memoryMib=56000), maxRetryCount=0,
-        maxRunDuration="3600s" if args.mode == "feasibility" else "172800s", environment=dict(variables=env), runnables=[
-            dict(displayName="search-" + args.mode, timeout="2700s" if args.mode == "feasibility" else "171600s",
+        maxRunDuration="3600s" if args.mode == "feasibility" else "86400s", environment=dict(variables=env), runnables=[
+            dict(displayName="search-" + args.mode, timeout="2700s" if args.mode == "feasibility" else "84600s",
                  script=dict(text=(ROOT / EXTRA_FILES[1]).read_text())),
             dict(displayName="final-upload", alwaysRun=True, timeout="900s",
                  script=dict(text=(ROOT / EXTRA_FILES[2]).read_text()))]))],
@@ -58,7 +58,7 @@ def build_job(args, bundle_hash):
             bootDisk=dict(sizeGb=100, type="pd-balanced")))]),
         logsPolicy=dict(destination="CLOUD_LOGGING"), labels=dict(
             workload="ucv-exp23-search", mode=args.mode,
-            search_budget="2s" if args.mode == "feasibility" else "500ms"))
+            search_budget="2s"))
 
 
 def read(*args):
@@ -129,7 +129,7 @@ def main():
                          "old bundles require a fresh run ID and preparation with the updated source")
     if request.get("experiment") != config(args.mode):
         raise ValueError("Prepared experiment configuration differs from this launcher. "
-                         "Use a fresh run ID and prepare again; an old 500ms bundle cannot become a two-second run.")
+                         "Use a fresh run ID and prepare again; old budgets/sample sizes cannot be changed by recovery.")
     for name, sha in request["prepared_files_sha256"].items():
         if common.sha256(directory / name) != sha:
             raise ValueError(f"Prepared input changed: {name}")

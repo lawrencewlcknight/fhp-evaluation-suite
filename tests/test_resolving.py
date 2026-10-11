@@ -16,7 +16,7 @@ from fhp_evaluation.best_response.flop import FlopBestResponse, make_state, vali
 from fhp_evaluation.best_response.validation import FixedPolicy
 from fhp_evaluation.duplicate import play_hand as reference_play
 from fhp_evaluation.game import FHP_GAME_PARAMETERS
-from fhp_evaluation.resolving.experiment import config, tasks
+from fhp_evaluation.resolving.experiment import config, tasks, pair_count, opponents, workload
 from fhp_evaluation.resolving.policy import ResolvingPolicy, play_hand
 from fhp_evaluation.resolving.solver import Deadline, prepare, response_values, certify, solve
 
@@ -108,21 +108,38 @@ def test_opponent_cards_never_enter_solver(small, monkeypatch):
 def test_protocol_size_and_registry():
     spec = config()
     plan = tasks(spec)
-    assert len(plan) == 480
-    assert sum(t["count"] * 2 for t in plan) == 240000
-    assert sum(t["count"] * 2 for t in plan if t["opponent"] != "blueprint") == 210000
+    assert len(plan) == 240
+    assert sum(t["count"] * 2 for t in plan) == 120000
+    assert sum(t["count"] * 2 for t in plan if t["opponent"] != "blueprint") == 60000
+    assert workload(spec)['total_hands'] == 180000
+    assert workload(spec)['all_flops_nominal_search_wall_seconds'] == 60000
+    assert spec['pairs_per_opponent'] == {'blueprint': 10000, 'exp8': 5000, 'exp9': 5000}
+    assert spec['rules'] == []
+    assert spec['gameplay_budget_seconds'] == 22 * 3600
+    assert {(t['seed'], t['opponent']) for t in plan[:9]} == {
+        (s, o) for s in (0, 1, 2) for o in ('blueprint', 'exp8', 'exp9')}
+    for seed in spec['training_seeds']:
+        for opponent in opponents(spec):
+            indices = [i for t in plan if t['seed'] == seed and t['opponent'] == opponent
+                       for i in range(t['start'], t['start'] + t['count'])]
+            assert indices == list(range(pair_count(spec, opponent)))
     assert len(spec["checkpoint_registry"]) == 9
     assert len(set(t["id"] for t in plan)) == len(plan)
 
 
-def test_two_second_feasibility_changes_only_timing_budgets():
+def test_gameplay_preserves_successful_search_settings():
     gameplay, feasibility = config(), config("feasibility")
-    assert gameplay["search_seconds"] == .5
-    assert gameplay["maximum_latency_seconds"] == 1.
+    assert gameplay["search_seconds"] == 2.
+    assert gameplay["maximum_latency_seconds"] == 4.
     assert feasibility["search_seconds"] == 2.
     assert feasibility["maximum_latency_seconds"] == 4.
-    assert {key for key in gameplay if gameplay[key] != feasibility[key]} == {
-        "search_seconds", "maximum_latency_seconds"}
+    for key in ('search_seconds', 'maximum_latency_seconds', 'max_iterations', 'processes', 'torch_threads',
+                'batch_size', 'preflight_seed', 'preflight_positions_per_seed', 'minimum_acceptance_rate',
+                'maximum_overrun_rate', 'policy_shift_threshold', 'certificate_tolerance_bb', 'checkpoint_registry'):
+        assert gameplay[key] == feasibility[key]
+    assert gameplay['protocol'] != feasibility['protocol']
+    assert gameplay['evaluation_seed'] != feasibility['evaluation_seed']
+    assert gameplay['evaluation_seed'] != gameplay['preflight_seed']
     assert feasibility["certificate_tolerance_bb"] == 1e-8
     assert feasibility["policy_shift_threshold"] == 1e-6
     with pytest.raises(ValueError, match="Expected"):
@@ -139,7 +156,7 @@ def test_resume_hash_and_seed_stream_independent_of_shards(tmp_path):
     for left, right in zip(a, b):
         np.testing.assert_array_equal(left, right)
     t = dict(id="fake", seed=0, opponent="blueprint", start=2, count=2)
-    result = dict(task=t, samples=[dict(pair_index=2), dict(pair_index=3)])
+    result = dict(task=t, samples=[dict(pair_index=i, search_seats=[1., 2.], baseline_seats=None) for i in (2, 3)])
     path = tmp_path / "shard.json"
     write_json(path, sign_shard(result, "identity"))
     assert read_shard(path, t, "identity") == result
@@ -155,21 +172,31 @@ def test_resume_hash_and_seed_stream_independent_of_shards(tmp_path):
 def test_paired_inference_and_complete_cohort(tmp_path):
     from fhp_evaluation.resolving.runner import summarise, write_report
     spec = config()
-    spec.update(pairs_per_match=2, pairs_per_shard=2)
+    spec.update(pairs_per_opponent={'blueprint': 4, 'exp8': 2, 'exp9': 2}, pairs_per_shard=2)
     results = []
     for t in tasks(spec):
         value = float(t["seed"] + 1)
         samples = [dict(pair_index=i, search_seats=[10 + value, 12 + value],
-                        baseline_seats=None if t["opponent"] == "blueprint" else [10., 12.]) for i in range(2)]
+                        baseline_seats=None if t["opponent"] == "blueprint" else [10., 12.])
+                   for i in range(t['start'], t['start'] + t['count'])]
         results.append(dict(task=t, samples=samples, traces=[], search_gameplay_seconds=1., baseline_gameplay_seconds=.1))
     result = summarise(results, spec)
     assert result["external_panel_uplift_across_training_seeds"]["seed_values"] == [1., 2., 3.]
     assert result["external_panel_uplift_across_training_seeds"]["n"] == 3
     assert result["primary_across_training_seeds"]["mean"] == 13.
+    assert result['primary_frozen_cohort_mc']['duplicate_pairs'] == 12
+    assert result['external_panel_frozen_cohort_mc']['duplicate_pairs'] == 12
+    assert result['workload']['total_hands'] == 72
     write_report(tmp_path, result)
     assert (tmp_path / "report.md").is_file()
     with pytest.raises(ValueError, match="Incomplete"):
         summarise(results[:-1], spec)
+    with pytest.raises(ValueError, match="duplicated"):
+        summarise(results + results[:1], spec)
+    broken = copy.deepcopy(results)
+    broken[1]['samples'][0]['baseline_seats'] = [1.]
+    with pytest.raises(ValueError):
+        summarise(broken, spec)
 
 
 @pytest.mark.parametrize("mode", ["gameplay", "feasibility"])
@@ -232,6 +259,11 @@ def test_native_production_network_and_stdlib_cloud_prepare(tmp_path):
     job = json.loads((output / "job.json").read_text())
     assert job["allocationPolicy"]["instances"][0]["policy"]["machineType"] == "n2-standard-16"
     assert job["taskGroups"][0]["taskCount"] == 1
+    task = job['taskGroups'][0]['taskSpec']
+    assert task['maxRunDuration'] == '86400s'
+    assert task['runnables'][0]['timeout'] == '84600s'
+    assert 'SEARCH_TIMEOUT=80400' in task['runnables'][0]['script']['text']
+    assert job['labels']['search_budget'] == '2s'
     request = json.loads((output / "request.json").read_text())
     assert len(request["experiment"]["checkpoint_registry"]) == 9
     assert request["mode"] == "gameplay"
@@ -347,7 +379,7 @@ def test_stdlib_feasibility_bundle(tmp_path):
     request['experiment'] = config('gameplay')
     (tmp_path / 'batch/request.json').write_text(json.dumps(request))
     proc = subprocess.run([*launcher, 'submit', *common], env=env, capture_output=True, text=True, timeout=30)
-    assert proc.returncode != 0 and 'old 500ms bundle' in proc.stderr
+    assert proc.returncode != 0 and 'old budgets/sample sizes' in proc.stderr
 
 
 def test_failed_probe_violation_tails():
@@ -363,7 +395,8 @@ def test_failed_probe_violation_tails():
     assert tail['n'] == 3 and tail['median'] == .02 and tail['maximum'] == .03
 
 
-def test_repo_root_wrapper_two_second_prepare(tmp_path):
+@pytest.mark.parametrize('mode', ['feasibility', 'gameplay'])
+def test_repo_root_wrapper_two_second_prepare(tmp_path, mode):
     root = Path(__file__).resolve().parents[1]
     native = root.parent / 'fhp_ucv_escher/fhp-ucv-escher-experiments'
     wrapper = native / 'gcp/run_exp23_flop_resolving.sh'
@@ -372,12 +405,152 @@ def test_repo_root_wrapper_two_second_prepare(tmp_path):
     env = dict(os.environ, PROJECT_ID='clever-overview-399515', REGION='europe-west1',
                BUCKET='gs://clever-overview-399515-fhp-escher-results',
                SA_EMAIL='fhp-escher-runner@clever-overview-399515.iam.gserviceaccount.com',
-               RUN_ID='exp23-search-wrapper-test', EXP23_MODE='feasibility',
+               RUN_ID='exp23-search-wrapper-test', EXP23_MODE=mode,
                FHP_EVALUATION_SUITE=str(root), EXP23_RUN_DIR=str(tmp_path / 'bundle'), PYTHON=sys.executable)
     proc = subprocess.run(['bash', str(wrapper), 'prepare'], cwd=native, env=env,
                           capture_output=True, text=True, timeout=30)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     request = json.loads((tmp_path / 'bundle/request.json').read_text())
-    assert request['experiment'] == config('feasibility')
+    assert request['experiment'] == config(mode)
     assert 'search budget=2s' in proc.stdout
     assert request['source']['source_only']
+
+
+def _tiny_result(task):
+    samples = [dict(pair_index=i, search_seats=[float(i + task['seed']), float(i + task['seed'] + 2)],
+                    baseline_seats=None if task['opponent'] == 'blueprint' else [0., 2.])
+               for i in range(task['start'], task['start'] + task['count'])]
+    traces = [dict(accepted=True, total_seconds=1.99, budget_seconds=2., iterations=270,
+                   reason='verified', preparation_completed=True, pair_index=i, seat=s)
+              for i in range(task['start'], task['start'] + task['count']) for s in (0, 1)]
+    return dict(task=task, samples=samples, traces=traces, search_gameplay_seconds=1.,
+                baseline_gameplay_seconds=.1, elapsed_seconds=1.1)
+
+
+def test_scoring_uses_matched_deals_and_seats_for_both_external_controls(monkeypatch):
+    from fhp_evaluation.resolving import runner
+    spec = config()
+    seen = []
+    class Search:
+        def __init__(self, game, policy, *, seconds, iterations):
+            assert seconds == 2.
+    monkeypatch.setattr(runner, 'ResolvingPolicy', Search)
+    monkeypatch.setattr(runner, 'load', lambda label, *args: (None, label))
+    def play(game, policies, *, chance_seed, action_seed):
+        seen.append((policies, chance_seed, action_seed))
+        return (1., -1.), []
+    monkeypatch.setattr(runner, 'play_hand', play)
+    for opponent in ('exp8', 'exp9'):
+        seen.clear()
+        task = dict(id='paired-fixture', seed=1, opponent=opponent, start=4, count=2)
+        row = runner.score_task(task, '', '', spec)
+        assert len(seen) == 8 and len(row['samples']) == 2
+        for group in (seen[:4], seen[4:]):
+            assert len({(int(c), int(a)) for _, c, a in group}) == 1
+            assert sum(isinstance(p[0], Search) for p, _, _ in group) == 1
+            assert sum(isinstance(p[1], Search) for p, _, _ in group) == 1
+        runner.validate_samples(row, task)
+
+
+def test_conditional_mc_interval_does_not_count_hands_as_training_seeds():
+    from fhp_evaluation.resolving.runner import conditional_mean
+    row = conditional_mean([dict(mean=m, se=3., n=10000) for m in (1., 2., 3.)])
+    assert row['mean'] == 2.
+    assert row['se'] == pytest.approx(np.sqrt(3.))
+    assert row['duplicate_pairs'] == 30000
+    assert row['independent_match_streams'] == 3
+
+
+def test_budget_exhaustion_resumes_without_replaying_signed_shards(tmp_path, monkeypatch):
+    from concurrent.futures import Future
+    from fhp_evaluation.resolving import runner
+    spec = config()
+    spec.update(pairs_per_opponent={'blueprint': 4, 'exp8': 2, 'exp9': 2}, pairs_per_shard=2)
+    class Pool:
+        def __init__(self):
+            self.submitted = []
+        def submit(self, fn, task, *args):
+            self.submitted.append(task['id'])
+            future = Future()
+            future.set_result(_tiny_result(task))
+            return future
+    actual_as_completed = runner.as_completed
+    def interrupted(pending, *, timeout):
+        assert timeout <= spec['gameplay_budget_seconds']
+        yield next(iter(pending))
+        raise TimeoutError('simulated budget limit')
+    monkeypatch.setattr(runner, 'as_completed', interrupted)
+    with pytest.raises(TimeoutError, match='fixed sample'):
+        runner.run_gameplay(Pool(), '', '', tmp_path, spec, 'identity')
+    progress = json.loads((tmp_path / 'analysis/progress.json').read_text())
+    assert progress['status'] == 'budget_exhausted' and progress['completed'] == 1
+    assert not (tmp_path / 'analysis/summary.json').exists()
+    assert not (tmp_path / 'analysis/SUCCESS.json').exists()
+    saved = list((tmp_path / 'analysis/task_results').glob('*.json'))
+    assert len(saved) == 1
+    original_bytes = saved[0].read_bytes()
+    monkeypatch.setattr(runner, 'as_completed', actual_as_completed)
+    pool = Pool()
+    results = runner.run_gameplay(pool, '', '', tmp_path, spec, 'identity')
+    assert len(pool.submitted) == len(tasks(spec)) - 1
+    assert saved[0].stem not in pool.submitted
+    assert saved[0].read_bytes() == original_bytes
+    assert runner.summarise(results, spec)['workload']['total_hands'] == 72
+    class NoSubmission:
+        def submit(self, *args):
+            raise AssertionError('All shards already complete')
+    assert len(runner.run_gameplay(NoSubmission(), '', '', tmp_path, spec, 'identity')) == len(tasks(spec))
+    with pytest.raises(ValueError, match='Incompatible'):
+        runner.run_gameplay(NoSubmission(), '', '', tmp_path, spec, 'changed-identity')
+
+
+def test_complete_gameplay_pipeline_and_budget_failure(tmp_path, monkeypatch):
+    from concurrent.futures import Future
+    from contextlib import contextmanager
+    from fhp_evaluation.resolving import runner
+    spec = config()
+    spec.update(pairs_per_opponent={'blueprint': 4, 'exp8': 2, 'exp9': 2}, pairs_per_shard=2)
+    monkeypatch.setattr(runner, 'config', lambda mode: copy.deepcopy(spec))
+    monkeypatch.setattr(runner, 'sha256', lambda p: spec['checkpoint_registry'][p.stem]['sha256'])
+    monkeypatch.setattr(runner, 'algebra_checks', lambda: {'passed': True})
+    smoke_seeds = []
+    class Pool:
+        def map(self, fn, positions, *rest):
+            positions = list(positions)
+            if fn == runner.parity_task:
+                return [dict(passed=True) for _ in positions]
+            if fn == runner.preflight_task:
+                return [dict(seed=s, accepted=True, total_seconds=1.99, budget_seconds=2.,
+                             iterations=270, preparation_completed=True, reason='verified') for s, i in positions]
+            assert fn == runner.score_task
+            smoke_seeds.extend(s['evaluation_seed'] for s in rest[-1])
+            return [_tiny_result(t) for t in positions]
+        def submit(self, fn, task, *args):
+            assert args[-1]['evaluation_seed'] == spec['evaluation_seed']
+            future = Future()
+            future.set_result(_tiny_result(task))
+            return future
+    @contextmanager
+    def pool(spec):
+        yield Pool()
+    monkeypatch.setattr(runner, 'worker_pool', pool)
+    output = tmp_path / 'completed'
+    runner.execute(tmp_path, tmp_path, output)
+    success = json.loads((output / 'analysis/SUCCESS.json').read_text())
+    assert success['search_hands'] == 48 and success['additional_baseline_hands'] == 24
+    assert success['total_hands'] == 72 and success['tasks'] == len(tasks(spec))
+    assert json.loads((output / 'analysis/gameplay_smoke.json').read_text())['workload']['total_hands'] == 60
+    assert set(smoke_seeds) == {spec['evaluation_seed'] + 1000000}
+    assert json.loads((output / 'analysis/summary.json').read_text())['primary_frozen_cohort_mc']['duplicate_pairs'] == 12
+    assert json.loads((output / 'analysis/progress.json').read_text())['status'] == 'succeeded'
+    assert 'Conditional Monte Carlo' in (output / 'analysis/report.md').read_text()
+    with pytest.raises(ValueError, match='Already completed'):
+        runner.execute(tmp_path, tmp_path, output)
+    def exhausted(*args):
+        raise TimeoutError('fixed sample incomplete')
+    monkeypatch.setattr(runner, 'run_gameplay', exhausted)
+    with pytest.raises(TimeoutError):
+        runner.execute(tmp_path, tmp_path, tmp_path / 'incomplete')
+    assert json.loads((tmp_path / 'incomplete/status.json').read_text())['status'] == 'budget_exhausted'
+    assert not (tmp_path / 'incomplete/analysis/SUCCESS.json').exists()
+    assert not (tmp_path / 'incomplete/analysis/summary.json').exists()

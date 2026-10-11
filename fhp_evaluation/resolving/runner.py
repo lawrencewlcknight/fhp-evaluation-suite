@@ -24,7 +24,7 @@ from ..game import load_fhp_game, MILLI_BIG_BLINDS_PER_CHIP
 from ..rule_agents import published_rule_agents
 from ..statistics import sample_summary
 from ..strategic_audit.tables import preflop_nodes
-from .experiment import config, source_hash, stream_seed, tasks, required_sources
+from .experiment import config, source_hash, stream_seed, tasks, required_sources, opponents, pair_count, workload
 from .policy import ResolvingPolicy, play_hand
 from .validation import algebra_checks, native_checks
 
@@ -190,7 +190,7 @@ def profile_task(row, input_root, native_root, spec):
 
 def deal_stream(spec, seed, opponent):
     rng = np.random.default_rng(stream_seed(spec, seed, opponent))
-    n = spec["pairs_per_match"]
+    n = pair_count(spec, opponent)
     return rng.integers(0, 2**63 - 1, size=n, dtype=np.int64), rng.integers(0, 2**63 - 1, size=n, dtype=np.int64)
 
 
@@ -241,26 +241,63 @@ def sign_shard(result, identity):
     return dict(identity=identity, payload=result, payload_sha256=digest(result))
 
 
+def validate_samples(result, task):
+    if result["task"] != task:
+        raise ValueError("Unexpected shard task")
+    samples = result["samples"]
+    if [s["pair_index"] for s in samples] != list(range(task["start"], task["start"] + task["count"])):
+        raise ValueError("Missing, duplicate or out-of-order deals")
+    searched = np.asarray([s["search_seats"] for s in samples], dtype=float)
+    if searched.shape != (task["count"], 2) or not np.isfinite(searched).all():
+        raise ValueError("Search samples require two finite seat payoffs per duplicate pair")
+    if task["opponent"] == "blueprint":
+        if any(s["baseline_seats"] is not None for s in samples):
+            raise ValueError("Direct-play primary must not contain an external-panel control")
+    else:
+        baseline = np.asarray([s["baseline_seats"] for s in samples], dtype=float)
+        if baseline.shape != searched.shape or not np.isfinite(baseline).all():
+            raise ValueError("External-panel samples require matched finite controls in both seats")
+
+
 def read_shard(path, task, identity):
     row = json.loads(Path(path).read_text())
     if (row.get("identity") != identity or digest(row["payload"]) != row.get("payload_sha256")
             or row["payload"]["task"] != task):
         raise ValueError(f"Incompatible or corrupted completed shard: {path}")
-    samples = row["payload"]["samples"]
-    if [s["pair_index"] for s in samples] != list(range(task["start"], task["start"] + task["count"])):
-        raise ValueError(f"Missing or duplicate deals: {path}")
+    validate_samples(row["payload"], task)
     return row["payload"]
 
 
+def conditional_mean(components):
+    """Equal-weight mean of independent match streams, holding models fixed.
+
+    This approximate MC interval measures deal/action noise, NOT uncertainty
+    over new training seeds. Keep it separate from the across-model t interval.
+    """
+    mean = float(np.mean([c["mean"] for c in components]))
+    se = float(np.sqrt(sum(c["se"] ** 2 for c in components)) / len(components))
+    return dict(mean=mean, se=se, ci95_low=mean - 1.959963984540054 * se,
+                ci95_high=mean + 1.959963984540054 * se,
+                independent_match_streams=len(components), duplicate_pairs=sum(c["n"] for c in components),
+                interpretation="Equal-weight conditional Monte Carlo normal-approximation interval for "
+                               "this frozen checkpoint cohort; not an interval over new trained models.")
+
+
 def summarise(results, spec):
+    expected = {t["id"]: t for t in tasks(spec)}
+    ids = [r["task"]["id"] for r in results]
+    if len(ids) != len(set(ids)) or set(ids) != set(expected):
+        raise ValueError("Incomplete/duplicated/unexpected cohort; refusing final summary")
+    for result in results:
+        validate_samples(result, expected[result["task"]["id"]])
     matches, seed_timings = [], {}
     for seed in spec["training_seeds"]:
         seed_rows = [r for r in results if r["task"]["seed"] == seed]
         seed_timings[str(seed)] = timing_summary([t for r in seed_rows for t in r["traces"]])
-        for opponent in ["blueprint", *spec["rules"], "exp8", "exp9"]:
+        for opponent in opponents(spec):
             rows = [r for r in seed_rows if r["task"]["opponent"] == opponent]
             samples = sorted([s for r in rows for s in r["samples"]], key=lambda x: x["pair_index"])
-            if [s["pair_index"] for s in samples] != list(range(spec["pairs_per_match"])):
+            if [s["pair_index"] for s in samples] != list(range(pair_count(spec, opponent))):
                 raise ValueError("Incomplete/duplicated matchup; refusing final summary")
             searched = np.asarray([s["search_seats"] for s in samples])
             row = dict(seed=seed, opponent=opponent, search=sample_summary(searched.mean(1)),
@@ -270,6 +307,7 @@ def summarise(results, spec):
             if opponent != "blueprint":
                 baseline = np.asarray([s["baseline_seats"] for s in samples])
                 row.update(baseline=sample_summary(baseline.mean(1)),
+                           baseline_seat_means=baseline.mean(0).tolist(),
                            paired_uplift=sample_summary((searched - baseline).mean(1)))
             matches.append(row)
     primary = [r["search"]["mean"] for r in matches if r["opponent"] == "blueprint"]
@@ -277,8 +315,13 @@ def summarise(results, spec):
                            if r["seed"] == seed and r["opponent"] != "blueprint"]))
              for seed in spec["training_seeds"]]
     return dict(units="milli-big-blinds per hand; positive favours search", matches=matches,
+                protocol=spec["protocol"], search_seconds=spec["search_seconds"], workload=workload(spec),
                 primary_across_training_seeds=dict(seed_values=primary, **sample_summary(primary)),
                 external_panel_uplift_across_training_seeds=dict(seed_values=panel, **sample_summary(panel)),
+                primary_frozen_cohort_mc=conditional_mean([r["search"] for r in matches if r["opponent"] == "blueprint"]),
+                external_panel_frozen_cohort_mc=conditional_mean([r["paired_uplift"] for r in matches if r["opponent"] != "blueprint"]),
+                measured_worker_seconds=dict(search=sum(r["search_gameplay_seconds"] for r in results),
+                                             control=sum(r["baseline_gameplay_seconds"] for r in results)),
                 timing_by_seed=seed_timings, inference="Three training trajectories, not opponents/hands, are the replication unit. "
                 "Within-match intervals condition on frozen policies and measure Monte Carlo uncertainty. "
                 "Across-seed t intervals are descriptive with n=3; secondary contrasts are exploratory. "
@@ -289,26 +332,51 @@ def write_report(analysis, result):
     """Compact outputs survive an analysis-only download excluding task_results."""
     stream = io.StringIO()
     writer = csv.writer(stream)
-    writer.writerow(["training_seed", "opponent", "search_mbb_per_hand", "baseline_mbb_per_hand",
+    writer.writerow(["training_seed", "opponent", "duplicate_pairs", "search_mbb_per_hand",
+                     "search_mc_ci95_low", "search_mc_ci95_high", "baseline_mbb_per_hand",
                      "paired_uplift_mbb_per_hand", "paired_mc_ci95_low", "paired_mc_ci95_high"])
     for row in result["matches"]:
         uplift = row.get("paired_uplift", {})
-        writer.writerow([row["seed"], row["opponent"], row["search"]["mean"],
+        writer.writerow([row["seed"], row["opponent"], row["search"]["n"], row["search"]["mean"],
+                         row["search"]["ci95_low"], row["search"]["ci95_high"],
                          row.get("baseline", {}).get("mean"), uplift.get("mean"),
                          uplift.get("ci95_low"), uplift.get("ci95_high")])
     text = ["# Experiment 23: paired flop re-solving", "", result["inference"], "",
+            f"Protocol: {result['protocol']}; search allowance: {result['search_seconds']:g}s; "
+            f"fixed completed sample: {result['workload']['total_hands']:,} hands.", "",
             "Values below are mbb/hand; positive favours search. Across-seed intervals are descriptive, n=3.", ""]
     for label, key in (("Search versus own blueprint (primary)", "primary_across_training_seeds"),
                        ("External-panel paired uplift (secondary)", "external_panel_uplift_across_training_seeds")):
         row = result[key]
         text += [f"## {label}", "", f"Mean {row['mean']:.3f}; 95% t interval "
                  f"[{row['ci95_low']:.3f}, {row['ci95_high']:.3f}]. Seed means: {row['seed_values']}.", ""]
+    text += ["## Conditional Monte Carlo precision for these frozen models", ""]
+    for label, key in (("Primary", "primary_frozen_cohort_mc"), ("External-panel uplift", "external_panel_frozen_cohort_mc")):
+        row = result[key]
+        text += [f"- {label}: mean {row['mean']:.3f}; approximate 95% MC interval "
+                 f"[{row['ci95_low']:.3f}, {row['ci95_high']:.3f}] from {row['duplicate_pairs']:,} duplicate pairs."]
+    text += ["", result["primary_frozen_cohort_mc"]["interpretation"], "",
+             "## Model-seed and opponent results", "",
+             "| Seed | Opponent | Pairs | Search payoff | Control payoff | Primary payoff / paired uplift | 95% MC interval |",
+             "| --- | --- | --- | --- | --- | --- | --- |"]
+    for row in result["matches"]:
+        estimate = row.get("paired_uplift", row["search"])
+        control = f"{row['baseline']['mean']:.3f}" if "baseline" in row else "—"
+        text += [f"| {row['seed']} | {row['opponent']} | {row['search']['n']} | {row['search']['mean']:.3f} | "
+                 f"{control} | {estimate['mean']:.3f} | [{estimate['ci95_low']:.3f}, {estimate['ci95_high']:.3f}] |"]
+    text += [""]
     text += ["## Deployment diagnostics", ""]
     for seed, row in result["timing_by_seed"].items():
         text += [f"- Seed {seed}: {row['attempts']} flop entries; verified-change acceptance "
                  f"{row['acceptance_rate']:.1%}; latency overruns {row['overrun_rate']:.1%}; "
                  f"median/p95/p99 {row.get('median_seconds', 0):.4f}/"
-                 f"{row.get('p95_seconds', 0):.4f}/{row.get('p99_seconds', 0):.4f} seconds."]
+                 f"{row.get('p95_seconds', 0):.4f}/{row.get('p99_seconds', 0):.4f} seconds; "
+                 f"changed visited-decision rate {row.get('changed_decision_rate')}; "
+                 f"mean decision total-variation distance {row.get('mean_decision_total_variation')}."]
+    text += ["", f"Summed worker gameplay seconds (not wall time): search "
+             f"{result['measured_worker_seconds']['search']:.1f}; controls "
+             f"{result['measured_worker_seconds']['control']:.1f}. Consult Batch duration and bootstrap logs "
+             "for setup, diagnostics, uploads and interrupted-attempt overhead."]
     text += ["", "Consult SUCCESS.json: a complete gameplay report can still fail the final latency/acceptance gates.",
              "Neither direct-play gains nor local continuation certificates establish whole-game exploitability.", ""]
     for name, content in (("matchups.csv", stream.getvalue()), ("report.md", "\n".join(text))):
@@ -317,7 +385,58 @@ def write_report(analysis, result):
         os.replace(temporary, analysis / name)
 
 
+def run_gameplay(pool, input_root, native_root, output, spec, identity):
+    """Complete signed shards, or leave a resumable, explicitly incomplete run."""
+    output = Path(output)
+    analysis = output / "analysis"
+    plan, results, pending = tasks(spec), [], {}
+    started = time.monotonic()
+
+    def progress(state, last_task=None):
+        counts = Counter((r["task"]["seed"], r["task"]["opponent"]) for r in results)
+        pairs = Counter()
+        for r in results:
+            pairs[r["task"]["seed"], r["task"]["opponent"]] += r["task"]["count"]
+        row = dict(status=state, identity=identity, completed=len(results), total=len(plan), last_task=last_task,
+                   attempt_gameplay_seconds=time.monotonic() - started,
+                   gameplay_budget_seconds=spec["gameplay_budget_seconds"],
+                   matches=[dict(seed=s, opponent=o, completed_pairs=pairs[s, o],
+                                 required_pairs=pair_count(spec, o), completed_shards=counts[s, o])
+                            for s in spec["training_seeds"] for o in opponents(spec)])
+        write_json(analysis / "progress.json", row)
+        write_json(output / "status.json", row)
+
+    for task in plan:
+        path = analysis / "task_results" / (task["id"] + ".json")
+        if path.exists():
+            results.append(read_shard(path, task, identity))
+        else:
+            pending[pool.submit(score_task, task, input_root, native_root, spec)] = task
+    progress("gameplay")
+    print(f"Gameplay: {len(results)}/{len(plan)} signed shards reused; "
+          f"{spec['gameplay_budget_seconds'] / 3600:g}h attempt budget; no payoff-based stopping.", flush=True)
+    try:
+        remaining = max(0., spec["gameplay_budget_seconds"] - (time.monotonic() - started))
+        for future in as_completed(pending, timeout=remaining):
+            task = pending[future]
+            result = future.result()
+            validate_samples(result, task)
+            write_json(analysis / "task_results" / (task["id"] + ".json"), sign_shard(result, identity))
+            results.append(result)
+            progress("gameplay", task["id"])
+            print(f"Completed {len(results)}/{len(plan)}: {task['id']}", flush=True)
+    except TimeoutError:
+        progress("budget_exhausted")
+        # worker_pool terminates running/queued workers on exit. Existing signed
+        # shards survive; neither truncated samples nor partial CIs are published.
+        raise TimeoutError("Gameplay budget exhausted before the fixed sample completed. "
+                           "Resume the same pinned run; no final result or SUCCESS marker was produced.") from None
+    progress("aggregating")
+    return results
+
+
 def execute(input_root, native_root, output, *, preflight_only=False):
+    attempt_started = time.monotonic()
     spec = config("feasibility" if preflight_only else "gameplay")
     output = Path(output)
     analysis = output / "analysis"
@@ -337,6 +456,8 @@ def execute(input_root, native_root, output, *, preflight_only=False):
             raise ValueError("Output identity differs; use a new run ID")
         write_json(manifest, contract)
         write_json(output / "status.json", dict(status="preflight", identity=identity))
+        if not preflight_only:
+            write_json(analysis / "workload.json", workload(spec))
         try:
             for label, record in required_sources(contract["mode"]).items():
                 if sha256(Path(input_root) / f"{label}.pkl") != record["sha256"]:
@@ -383,32 +504,37 @@ def execute(input_root, native_root, output, *, preflight_only=False):
                                                                           gameplay_performed=False))
                     write_json(output / "status.json", dict(status="preflight_passed", identity=identity))
                     return
-                plan, results, pending = tasks(spec), [], {}
-                for task in plan:
-                    path = analysis / "task_results" / (task["id"] + ".json")
-                    if path.exists():
-                        results.append(read_shard(path, task, identity))
-                    else:
-                        future = pool.submit(score_task, task, input_root, native_root, spec)
-                        pending[future] = task
-                for future in as_completed(pending):
-                    task = pending[future]
-                    result = future.result()
-                    write_json(analysis / "task_results" / (task["id"] + ".json"), sign_shard(result, identity))
-                    results.append(result)
-                    write_json(output / "status.json", dict(status="gameplay", completed=len(results), total=len(plan),
-                                                             last_task=task["id"], identity=identity))
-                    print(f"Completed {len(results)}/{len(plan)}: {task['id']}", flush=True)
+                # Exercise all nine actual policies and paired-control paths
+                # before committing hours. Separate streams; no payoff gate and
+                # no smoke sample enters the final fixed-sample analysis.
+                smoke_spec = dict(spec, evaluation_seed=spec["evaluation_seed"] + 1000000,
+                                  pairs_per_opponent={o: 2 for o in opponents(spec)})
+                smoke_plan = tasks(smoke_spec)
+                smoke = list(pool.map(score_task, smoke_plan, [input_root] * len(smoke_plan),
+                                      [native_root] * len(smoke_plan), [smoke_spec] * len(smoke_plan)))
+                for row, task in zip(smoke, smoke_plan):
+                    validate_samples(row, task)
+                write_json(analysis / "gameplay_smoke.json", dict(passed=True, results=smoke,
+                            evaluation_seed=smoke_spec["evaluation_seed"], workload=workload(smoke_spec),
+                            note="Separate diagnostic deals; no payoff threshold; excluded from final estimates."))
+                results = run_gameplay(pool, input_root, native_root, output, spec, identity)
                 result = summarise(results, spec)
+                result["current_attempt_seconds_through_aggregation"] = time.monotonic() - attempt_started
                 write_json(analysis / "summary.json", result)
                 write_report(analysis, result)
-                for row in result["timing_by_seed"].values():
-                    enforce_gate(row, spec)
-                write_json(analysis / "SUCCESS.json", dict(status="succeeded", identity=identity, tasks=len(plan),
-                                                            search_hands=240000, additional_baseline_hands=210000))
+                final_gates = assess_gates(result["timing_by_seed"], spec)
+                write_json(analysis / "gameplay_gates.json", final_gates)
+                if not final_gates["passed"]:
+                    raise RuntimeError("Complete fixed-sample gameplay failed final engineering gates; "
+                                       "inspect gameplay_gates.json. Payoffs did not control stopping.")
+                write_json(analysis / "SUCCESS.json", dict(status="succeeded", identity=identity,
+                                                            tasks=len(tasks(spec)), **workload(spec)))
+                progress = json.loads((analysis / "progress.json").read_text())
+                write_json(analysis / "progress.json", dict(progress, status="succeeded"))
                 write_json(output / "status.json", dict(status="succeeded", identity=identity))
         except BaseException as exc:
-            write_json(output / "status.json", dict(status="failed", identity=identity, error=repr(exc)))
+            write_json(output / "status.json", dict(status="budget_exhausted" if isinstance(exc, TimeoutError) else "failed",
+                                                    identity=identity, error=repr(exc)))
             raise
 
 

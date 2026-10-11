@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 
 PROTOCOL = "fhp_exp23_flop_resolving_v1"
+GAMEPLAY_PROTOCOL = "fhp_exp23_flop_resolving_v2_expanded_2s"
 # Load the historical registry without importing the evaluation package (whose
 # public __init__ imports NumPy/OpenSpiel). Laptop Batch preparation is stdlib-only.
 _module_spec = importlib.util.spec_from_file_location(
@@ -38,10 +39,10 @@ def checkpoint_registry():
 def config(mode="gameplay"):
     if mode not in ("gameplay", "feasibility"):
         raise ValueError("Expected gameplay or feasibility mode")
-    # The two-second development probe is deliberately separate from the
-    # original gameplay protocol. Passing it never launches/retunes gameplay.
-    search_seconds = 2. if mode == "feasibility" else .5
-    return dict(protocol=PROTOCOL, experiment=23, training_seeds=[0, 1, 2],
+    # Keep the successful feasibility protocol intact. The expanded gameplay
+    # study has a new identity and independent deal stream, never old shards.
+    search_seconds = 2.
+    spec = dict(protocol=PROTOCOL, experiment=23, training_seeds=[0, 1, 2],
                 search_seconds=search_seconds, max_iterations=10000, pairs_per_match=5000,
                 pairs_per_shard=250, processes=4, torch_threads=4, batch_size=1024,
                 evaluation_seed=20261011, preflight_seed=20261012,
@@ -55,6 +56,14 @@ def config(mode="gameplay"):
                 rules=list(RULES), learned_opponents=["exp8_48h_same_label", "exp9_24h_same_label"],
                 checkpoint_registry=checkpoint_registry(),
                 warning="Local numerical BR certificates are not whole-game exploitability measurements.")
+    if mode == "gameplay":
+        spec.pop("pairs_per_match")
+        spec.update(protocol=GAMEPLAY_PROTOCOL, evaluation_seed=20261013, rules=[],
+                    pairs_per_opponent={"blueprint": 10000, "exp8": 5000, "exp9": 5000},
+                    gameplay_budget_seconds=22 * 60 * 60,
+                    stopping_rule="Complete the fixed sample; no payoff-based stopping. "
+                                  "Budget exhaustion is incomplete and requires recovery, not a smaller final sample.")
+    return spec
 
 
 def required_sources(mode):
@@ -64,21 +73,51 @@ def required_sources(mode):
             if mode == "gameplay" or k.startswith("exp16_")}
 
 
+def opponents(spec):
+    return ["blueprint", *spec["rules"], "exp8", "exp9"]
+
+
+def pair_count(spec, opponent):
+    if opponent not in opponents(spec):
+        raise ValueError(f"Unspecified opponent: {opponent}")
+    # The old field remains only in the unchanged feasibility manifest.
+    count = (spec["pairs_per_opponent"][opponent] if "pairs_per_opponent" in spec else spec["pairs_per_match"])
+    if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+        raise ValueError("Pair count must be a positive integer")
+    return count
+
+
+def workload(spec):
+    seeds = len(spec["training_seeds"])
+    search_hands = seeds * sum(2 * pair_count(spec, o) for o in opponents(spec))
+    controls = seeds * sum(2 * pair_count(spec, o) for o in opponents(spec) if o != "blueprint")
+    return dict(search_hands=search_hands, additional_baseline_hands=controls,
+                total_hands=search_hands + controls, model_seeds=list(spec["training_seeds"]),
+                pairs_per_seed={o: pair_count(spec, o) for o in opponents(spec)},
+                all_flops_nominal_search_wall_seconds=search_hands * spec["search_seconds"] / spec["processes"],
+                projection_note="Ideal four-worker search time if all hands reach the flop; excludes overhead, "
+                                "is not a hard runtime guarantee and is not a stopping rule.")
+
+
 def tasks(spec=None):
     spec = config() if spec is None else spec
     rows = []
-    for seed in spec["training_seeds"]:
-        for opponent in ["blueprint", *spec["rules"], "exp8", "exp9"]:
-            for start in range(0, spec["pairs_per_match"], spec["pairs_per_shard"]):
+    # Interleave seeds/opponents so early infrastructure interruptions do not
+    # allocate all completed work to just one model. Seeds do not depend on order.
+    for start in range(0, max(pair_count(spec, o) for o in opponents(spec)), spec["pairs_per_shard"]):
+        for seed in spec["training_seeds"]:
+            for opponent in opponents(spec):
+                if start >= pair_count(spec, opponent):
+                    continue
                 rows.append(dict(id=f"seed{seed}-{opponent}-{start:05d}", seed=seed,
                                  opponent=opponent, start=start,
-                                 count=min(spec["pairs_per_shard"], spec["pairs_per_match"] - start)))
+                                 count=min(spec["pairs_per_shard"], pair_count(spec, opponent) - start)))
     return rows
 
 
 def stream_seed(spec, seed, opponent):
     # Task scheduling, sharding, search RNG and resume cannot change the deals.
-    label = f"{PROTOCOL}:{spec['evaluation_seed']}:{seed}:{opponent}"
+    label = f"{spec['protocol']}:{spec['evaluation_seed']}:{seed}:{opponent}"
     return int.from_bytes(hashlib.sha256(label.encode()).digest()[:8], "little")
 
 

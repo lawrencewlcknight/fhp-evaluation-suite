@@ -103,17 +103,24 @@ def main():
         checks["timing_only_not_quality_evidence"].append(stats)
     spec = config()
     spec["checkpoint_registry"]["exp16_seed0_48h"]["sha256"] = sha256_file(path)
+    # Production-shaped synthetic opponents exercise both learned-policy paths.
+    # These are test fixtures, not substitutes for the pinned trained models.
+    for label in ("exp8_seed0_48h", "exp9_seed0_24h"):
+        other_path = path.with_name(label + ".pkl")
+        other_path.write_bytes(path.read_bytes())
+        spec["checkpoint_registry"][label]["sha256"] = sha256_file(other_path)
     spec["search_seconds"] = 0.
-    task = dict(id="native-zero-budget", seed=0, opponent="candid_statistician", start=0, count=3)
+    task = dict(id="native-zero-budget", seed=0, opponent="exp8", start=0, count=3)
     control = score_task(task, output, native_root, spec)
     assert all(s["search_seats"] == s["baseline_seats"] for s in control["samples"])
     checks["native_zero_budget_duplicate_pairs"] = len(control["samples"])
-    spec["search_seconds"] = .5
+    spec["search_seconds"] = 2.
     task.update(id="native-gameplay-smoke", opponent="blueprint", count=3)
     # Exercise spawn after native loading in the parent, which otherwise can
     # shadow the suite with the native checkout's older evaluation package.
     with worker_pool(spec) as pool:
-        futures = [pool.submit(score_task, task, output, native_root, spec) for _ in range(4)]
+        futures = [pool.submit(score_task, dict(task, opponent=o), output, native_root, spec)
+                   for o in ("blueprint", "exp8", "exp9", "blueprint")]
         for future in futures:
             played = future.result(timeout=45)
             assert len(played["samples"]) == 3

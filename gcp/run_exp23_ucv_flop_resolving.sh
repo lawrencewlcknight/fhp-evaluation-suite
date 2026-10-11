@@ -71,7 +71,9 @@ for name, record in sources.items():
 (work / "output/checkpoint_sources.json").write_text(json.dumps(sources, indent=2))
 DOWNLOAD
 EXTRA_ARGS=()
-SEARCH_TIMEOUT=166000
+# 22h cooperative gameplay deadline + 10min preflight + 10min teardown margin.
+# The main runnable is capped at 23.5h; Batch at 24h including final uploads.
+SEARCH_TIMEOUT=80400
 if [[ "$FHP_SEARCH_MODE" == feasibility ]]; then
   EXTRA_ARGS+=(--preflight-only)
   SEARCH_TIMEOUT=600
