@@ -165,7 +165,22 @@ def step(optimizer, model, loss):
     optimizer.step()
 
 
-def train_attacker(game, victim, seat, seed, cfg, progress=lambda **kw: None):
+def train_attacker(game, victim, seat, seed, cfg, progress=lambda **kw: None, *,
+                   checkpoint_seconds=(), on_checkpoint=None, exploration_seconds=None):
+    """Original Exp21 learner, with optional observational Exp26 snapshots.
+
+    Snapshot I/O is excluded from the active clock. No evaluation, RNG draws or
+    fitting occurs in the snapshot callback. The default Exp21 exploration
+    schedule remains tied to cfg.attack_seconds; Exp26 fixes it to 900 seconds.
+    Checkpoints are taken at completed collection/update-wave boundaries.
+    """
+    checkpoints = list(checkpoint_seconds)
+    if (checkpoints != sorted(set(checkpoints)) or any(t < 0 or t > cfg.attack_seconds for t in checkpoints)
+            or (bool(checkpoints) != (on_checkpoint is not None))):
+        raise ValueError("Ordered, unique in-budget snapshots require a callback")
+    exploration_seconds = cfg.attack_seconds if exploration_seconds is None else exploration_seconds
+    if exploration_seconds <= 0:
+        raise ValueError("Positive exploration horizon required")
     rng = np.random.default_rng(seed)
     width = victim.feature_encoder.policy_layout.total_size
     model = attacker_model(width, seed)
@@ -175,9 +190,31 @@ def train_attacker(game, victim, seat, seed, cfg, progress=lambda **kw: None):
     actor = NetworkPolicy(model, victim.feature_encoder, greedy=True)
     replay = TransitionReplay(cfg.replay_capacity, width)
     started, waves, updates, hands = time.monotonic(), 0, 0, 0
+    excluded_seconds = 0.
     losses = []
-    while (waves == 0 or time.monotonic() - started < cfg.attack_seconds) and hands < cfg.episode_limit:
-        fraction = min(1., (time.monotonic() - started) / cfg.attack_seconds)
+
+    def elapsed():
+        return time.monotonic() - started - excluded_seconds
+
+    def snapshot():
+        nonlocal excluded_seconds
+        active = elapsed()
+        while checkpoints and checkpoints[0] <= active:
+            nominal = checkpoints.pop(0)
+            stamp = time.monotonic()
+            on_checkpoint(nominal, dict(model=model.state_dict(), target=target.state_dict(),
+                optimizer=optimizer.state_dict(), rng=deepcopy(rng.bit_generator.state), seat=seat,
+                seed=seed, width=width, replay_retained=False,
+                continuation="Playable attacker only; transition replay not retained, not exact training resume"),
+                dict(active_seconds=active, nominal_seconds=nominal, hands=hands, updates=updates,
+                     replay_rows=replay.size, waves=waves, hash=model_hash(model),
+                     mean_last_loss=float(np.mean(losses[-100:])) if losses else None))
+            excluded_seconds += time.monotonic() - stamp
+
+    if checkpoints:
+        snapshot()
+    while (waves == 0 or elapsed() < cfg.attack_seconds) and hands < cfg.episode_limit:
+        fraction = min(1., elapsed() / exploration_seconds)
         epsilon = 1. - .95 * min(1., fraction / .8)
         n = min(cfg.environments, cfg.episode_limit - hands)
         episodes = collect(game, actor, [victim] * n, [seat] * n, rng, epsilon=epsilon)
@@ -196,7 +233,11 @@ def train_attacker(game, victim, seat, seed, cfg, progress=lambda **kw: None):
                 if updates % cfg.target_sync_updates == 0:
                     target.load_state_dict(model.state_dict())
         progress(kind="attacker", seat=seat, hands=hands, updates=updates,
-                 elapsed_seconds=time.monotonic() - started, replay_rows=replay.size)
+                 elapsed_seconds=elapsed(), replay_rows=replay.size)
+        if checkpoints:
+            snapshot()
+    if checkpoints:
+        raise RuntimeError("Episode limit prevented the fixed snapshot schedule from completing")
     if updates == 0:
         raise RuntimeError("Attacker budget ended before any network update")
     state = dict(model=model.state_dict(), target=target.state_dict(), optimizer=optimizer.state_dict(),
@@ -204,7 +245,9 @@ def train_attacker(game, victim, seat, seed, cfg, progress=lambda **kw: None):
                  replay_retained=False, continuation="new replay required; not exact training resume")
     metrics = dict(seconds=time.monotonic() - started, hands=hands, updates=updates,
                    mean_last_loss=float(np.mean(losses[-100:])), hash=model_hash(model),
-                   initial_hash=model_hash(initial), seat=seat, seed=seed)
+                   initial_hash=model_hash(initial), seat=seat, seed=seed,
+                   active_seconds=elapsed(), snapshot_seconds=excluded_seconds,
+                   exploration_seconds=exploration_seconds)
     return actor, NetworkPolicy(initial, victim.feature_encoder, greedy=True), state, metrics
 
 
