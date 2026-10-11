@@ -51,7 +51,7 @@ def identity(spec):
 
 
 def run_bounded(spec, directory, *, max_seconds=300., max_rss_mb=4096., resume=False,
-                command=None):
+                command=None, cancel_event=None):
     if max_seconds <= 0 or max_rss_mb <= 0:
         raise ValueError("Positive runtime and RSS limits required")
     directory = Path(directory).resolve()
@@ -91,6 +91,9 @@ def run_bounded(spec, directory, *, max_seconds=300., max_rss_mb=4096., resume=F
             write_json(directory / "run.json", record)
             with (directory / "resources.jsonl").open("w") as resources:
                 while process.poll() is None:
+                    if cancel_event is not None and cancel_event.is_set():
+                        status = "cancelled"
+                        break
                     rss = 0
                     try:
                         monitor = psutil.Process(process.pid)

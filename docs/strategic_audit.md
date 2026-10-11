@@ -215,7 +215,7 @@ shares tables across opponents/candidates, caches per-board hand tags and batche
 native inference. Published rule-agent flop equities are computed once per board
 by the exact vector kernel; their native action thresholds and bluff logic remain
 unchanged, with independent scalar parity checks. It does not yet share preflop inference across different boards,
-or distribute board shards across VMs. Inference exports are sequential and
+or distribute board shards across VMs. Default inference exports are sequential and
 bounded in native model memory. One `n2-standard-16` can run the workflow with
 conservative thread/RSS limits; whole-production runtime needs a trained-model
 pilot. The default representative sample is intentionally small and adjustable.
@@ -226,3 +226,37 @@ proof for every information set. Independent reduced-deck validation covers all
 audited decisions and hands for multiple policies, with full-deck spot checks in
 the test suite. A failed check blocks table publication rather than silently
 changing the policy or smoothing its probabilities.
+
+
+## Optional board-parallel export execution
+
+The Python API `strategic_audit.workflow.run(..., board_exports=...)` can opt
+into bounded one-policy/one-board exports. Callers omitting this argument retain
+the sequential per-policy workflow. The dictionary specifies `workers`,
+`task_seconds`, `session_seconds` and `cpu_limit`, all positive integers.
+`workers * threads` must fit the declared CPU allocation; `max_rss_mb` is divided
+among concurrent workers. Numerical analysis runs after all tables exist, under
+the remaining session budget and its normal per-attempt limit. Policy queries,
+archive weighting, coverage, validation and scoring are unchanged.
+
+The execution dictionary is part of the immutable manifest/fingerprint. Use a
+fresh namespace for changed code or resources; never relabel old success markers.
+Within a compatible run, checksum-valid boards are reused and incomplete boards
+alone are retried by an explicit resume. One coordinator holds the audit lock;
+each worker owns a distinct board path. Cancellation signals only process groups
+created by that invocation.
+
+SD-CFR tasks run first. `export_progress.json` and
+`export_segments/attempt_*/progress.json` retain per-wave full-archive throughput,
+task timing, completed/remaining counts and per-worker RSS. A sum of worker peaks
+is an upper bound, not simultaneous measured memory. The first wave is a throughput
+pilot, not a controlled serial-versus-parallel speedup estimate. To compare
+allocations, use separate namespaces with the same frozen panel and different
+worker counts, then compare like-for-like task timings.
+
+An exhausted session raises `AuditDeferred` and records `deferred_time_budget`.
+Callers may upload progress and finish the invocation, but must not publish a
+completed scientific result. Per-board timeout, memory, checksum, launch and
+numerical failures remain errors. No successful comparison may be published
+until the complete table panel and numerical analysis finish. There are no
+automatic cloud submissions, retries, archive thinning or assessment unlocks.

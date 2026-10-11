@@ -130,7 +130,13 @@ def exclusive(directory):
 
 
 def run(spec, library, directory, *, partition="development", include_reference=False,
-        unlock_assessment=False, resume=False, threads=2, max_seconds=7200, max_rss_mb=8192):
+        unlock_assessment=False, resume=False, threads=2, max_seconds=7200, max_rss_mb=8192,
+        board_exports=None):
+    started = time.monotonic()
+    if board_exports is not None:
+        from .board_export import AuditDeferred, export_boards, next_attempt, validate_config
+        board_exports = validate_config(board_exports, threads, max_rss_mb)
+        deadline = started + board_exports["session_seconds"]
     if importlib.metadata.version("open_spiel") != "1.6.3":
         raise RuntimeError("Pinned OpenSpiel 1.6.3 required for production audit runs")
     validate_spec(spec)
@@ -153,6 +159,9 @@ def run(spec, library, directory, *, partition="development", include_reference=
                       evaluator_source_sha256=source_hash(Path(__file__).resolve().parents[1]),
                       packages={p: importlib.metadata.version(p) for p in ("numpy", "torch", "open_spiel", "scipy")},
                       policies={p: policy_identity(policies[p]) for p in sorted(used)})
+    if board_exports is not None:
+        provenance["board_exports"] = board_exports
+        provenance["board_export_limits"] = dict(max_rss_mb=max_rss_mb, analysis_max_seconds=max_seconds)
     fingerprint = digest(provenance)
     directory = Path(directory).resolve()
     with exclusive(directory):
@@ -165,7 +174,17 @@ def run(spec, library, directory, *, partition="development", include_reference=
                 raise ValueError("Cannot resume an audit without a manifest")
             write_json(manifest, provenance)
         write_json(directory / "status.json", dict(status="running", identity=fingerprint))
-        for label in sorted(used):
+        if board_exports is not None:
+            try:
+                export_boards(provenance, boards, directory, fingerprint, board_exports,
+                              deadline=deadline, max_rss_mb=max_rss_mb, completed=completed)
+            except AuditDeferred as error:
+                write_json(directory / "status.json", dict(status="deferred_time_budget", message=str(error)))
+                raise
+            except BaseException as error:
+                write_json(directory / "status.json", dict(status="export_failed", message=str(error)))
+                raise
+        for label in (sorted(used) if board_exports is None else []):
             cache = directory / "tables" / label
             if all(completed(cache / board_key(b), fingerprint, "tables.npz") for b in boards):
                 continue
@@ -181,12 +200,22 @@ def run(spec, library, directory, *, partition="development", include_reference=
                 raise RuntimeError(f"Policy export failed; see {attempt / 'stderr.log'}. Successful boards can be resumed.")
         # Numerical analysis is also monitored, with board-level durable progress.
         attempts = directory / "workers" / "analysis"
-        attempt = attempts / f"attempt_{len(list(attempts.glob('attempt_*'))):03d}"
+        attempt = (attempts / f"attempt_{len(list(attempts.glob('attempt_*'))):03d}"
+                   if board_exports is None else next_attempt(attempts))
+        analysis_seconds = max_seconds
+        if board_exports is not None:
+            analysis_seconds = min(max_seconds, deadline - time.monotonic())
+            if analysis_seconds < 60:
+                write_json(directory / "status.json", dict(status="deferred_time_budget", phase="analysis"))
+                raise AuditDeferred("Exports complete; resume to finish the board-resumable analysis.")
         result = run_bounded(dict(operation="analysis", root=str(directory), identity=fingerprint, threads=threads),
-                             attempt, max_seconds=max_seconds, max_rss_mb=max_rss_mb,
+                             attempt, max_seconds=analysis_seconds, max_rss_mb=max_rss_mb,
                              command=[sys.executable, "-m", "fhp_evaluation.strategic_audit.worker", str(attempt / "spec.json")])
         if result["status"] != "succeeded":
             write_json(directory / "status.json", dict(status=result["status"], worker=str(attempt)))
+            if board_exports is not None and result["status"] == "time_limit":
+                write_json(directory / "status.json", dict(status="deferred_time_budget", phase="analysis", worker=str(attempt)))
+                raise AuditDeferred("Analysis time budget reached; completed analysis boards can be resumed.")
             raise RuntimeError(f"Analysis failed; see {attempt / 'stderr.log'}")
         write_json(directory / "status.json", dict(status="succeeded", identity=fingerprint,
                                                    report=str(directory / "analysis" / "report.html")))
