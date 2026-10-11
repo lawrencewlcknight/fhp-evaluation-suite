@@ -115,6 +115,20 @@ def test_protocol_size_and_registry():
     assert len(set(t["id"] for t in plan)) == len(plan)
 
 
+def test_two_second_feasibility_changes_only_timing_budgets():
+    gameplay, feasibility = config(), config("feasibility")
+    assert gameplay["search_seconds"] == .5
+    assert gameplay["maximum_latency_seconds"] == 1.
+    assert feasibility["search_seconds"] == 2.
+    assert feasibility["maximum_latency_seconds"] == 4.
+    assert {key for key in gameplay if gameplay[key] != feasibility[key]} == {
+        "search_seconds", "maximum_latency_seconds"}
+    assert feasibility["certificate_tolerance_bb"] == 1e-8
+    assert feasibility["policy_shift_threshold"] == 1e-6
+    with pytest.raises(ValueError, match="Expected"):
+        config("unknown")
+
+
 def test_resume_hash_and_seed_stream_independent_of_shards(tmp_path):
     from fhp_evaluation.cohort import write_json
     from fhp_evaluation.resolving.runner import read_shard, sign_shard, deal_stream
@@ -158,14 +172,42 @@ def test_paired_inference_and_complete_cohort(tmp_path):
         summarise(results[:-1], spec)
 
 
-def test_feasibility_gates():
+@pytest.mark.parametrize("mode", ["gameplay", "feasibility"])
+def test_feasibility_gates(mode):
     from fhp_evaluation.resolving.runner import enforce_gate
-    spec = config()
-    good = dict(attempts=24, acceptance_rate=.5, overrun_rate=0., maximum_seconds=.499)
+    spec = config(mode)
+    good = dict(attempts=24, acceptance_rate=3 / 24, overrun_rate=0.,
+                maximum_seconds=spec["search_seconds"] - .001)
     enforce_gate(good, spec)
-    for key, value in (("attempts", 0), ("acceptance_rate", 0.), ("overrun_rate", .2), ("maximum_seconds", 2.)):
+    for key, value in (("attempts", 0), ("acceptance_rate", 2 / 24), ("overrun_rate", .2),
+                       ("maximum_seconds", spec["maximum_latency_seconds"] + .001),
+                       ("acceptance_rate", float("nan")), ("maximum_seconds", float("inf"))):
         with pytest.raises(RuntimeError, match="feasibility"):
             enforce_gate(dict(good, **{key: value}), spec)
+    with pytest.raises(RuntimeError, match=f"{spec['search_seconds']:g}s feasibility"):
+        enforce_gate(dict(good, acceptance_rate=0), spec)
+
+
+@pytest.mark.parametrize("elapsed, accepted", [(1.99, True), (2.01, False)])
+def test_two_second_policy_budget_and_late_candidate_fallback(small, monkeypatch, elapsed, accepted):
+    from types import SimpleNamespace
+    from fhp_evaluation.resolving import policy
+    clock = [0.]
+    monkeypatch.setattr(policy.time, "perf_counter", lambda: clock[0])
+    def solved(*args, **kwargs):
+        assert kwargs["seconds"] == pytest.approx(1.998)
+        clock[0] = elapsed
+        return SimpleNamespace(nodes=[]), {}, dict(accepted=True, reason="verified")
+    monkeypatch.setattr(policy, "solve", solved)
+    target = PolicyAdapter(FixedPolicy(small))
+    state = make_state(small, validate_game(small), (1, 2), 0, board=(0, 3, 6), preflop=(1, 1))
+    search = ResolvingPolicy(small, target, seconds=config("feasibility")["search_seconds"])
+    search.observe_flop_entry(state, 0)
+    assert search.stats["budget_seconds"] == 2.
+    assert search.stats["accepted"] is accepted
+    assert (search.strategy is not None) is accepted
+    if not accepted:
+        assert search.stats["reason"] == "deadline_overrun"
 
 
 def test_native_production_network_and_stdlib_cloud_prepare(tmp_path):
@@ -181,7 +223,7 @@ def test_native_production_network_and_stdlib_cloud_prepare(tmp_path):
     assert checks["bitwise_feature_rows"] == 19116
     output = tmp_path / "batch"
     proc = subprocess.run([sys.executable, "-S", str(root / "gcp/exp23_ucv_flop_resolving_batch.py"),
-                           "prepare", "--project", "clever-overview-399515", "--region", "europe-west1",
+                           "prepare", "--mode", "gameplay", "--project", "clever-overview-399515", "--region", "europe-west1",
                            "--bucket", "gs://clever-overview-399515-fhp-escher-results", "--service-account",
                            "fhp-escher-runner@clever-overview-399515.iam.gserviceaccount.com", "--run-id",
                            "exp23-search-unittest", "--native-repo", str(native), "--run-dir", str(output)],
@@ -192,6 +234,8 @@ def test_native_production_network_and_stdlib_cloud_prepare(tmp_path):
     assert job["taskGroups"][0]["taskCount"] == 1
     request = json.loads((output / "request.json").read_text())
     assert len(request["experiment"]["checkpoint_registry"]) == 9
+    assert request["mode"] == "gameplay"
+    assert request["experiment"] == config("gameplay")
     assert request["source"]["source_only"]
     assert (output / "source.tar.gz").stat().st_size < 16 * 1024**2
 
@@ -224,6 +268,7 @@ def test_feasibility_mode_stops_before_gameplay(tmp_path, monkeypatch):
     monkeypatch.setattr(runner, 'sha256', lambda path: sources[path.stem]['sha256'])
     monkeypatch.setattr(runner, 'algebra_checks', lambda: {'passed': True})
     calls = []
+    accept = [True]
     class Pool:
         def map(self, fn, positions, *rest):
             positions = list(positions)
@@ -233,7 +278,8 @@ def test_feasibility_mode_stops_before_gameplay(tmp_path, monkeypatch):
             if fn == runner.profile_task:
                 return [{'passed': True} for _ in positions]
             assert fn == runner.preflight_task
-            return [dict(seed=seed, accepted=True, total_seconds=.4, budget_seconds=.5,
+            assert all(spec['search_seconds'] == 2. for spec in rest[-1])
+            return [dict(seed=seed, accepted=accept[0], total_seconds=1.99, budget_seconds=2.,
                          iterations=20, reason='verified', preparation_completed=True)
                     for seed, index in positions]
         def submit(self, *args, **kwargs):
@@ -248,14 +294,22 @@ def test_feasibility_mode_stops_before_gameplay(tmp_path, monkeypatch):
     assert (output / 'analysis/FEASIBILITY_SUCCESS.json').is_file()
     assert not (output / 'analysis/SUCCESS.json').exists()
     assert not (output / 'analysis/task_results').exists()
+    assert json.loads((output / 'analysis/manifest.json').read_text())['spec'] == config('feasibility')
+    assert json.loads((output / 'analysis/feasibility_gates.json').read_text())['passed']
+    assert '2 seconds' in (output / 'analysis/feasibility_report.md').read_text()
+    assert '2s' in json.loads((output / 'analysis/preparation_profile.json').read_text())['note']
     with pytest.raises(ValueError, match='Already completed'):
         runner.execute(tmp_path, tmp_path, output, preflight_only=True)
     # A failed gate is still a failed feasibility job, never a silently passed pilot.
-    monkeypatch.setattr(runner, 'enforce_gate', lambda *args: (_ for _ in ()).throw(RuntimeError('test gate')))
-    with pytest.raises(RuntimeError, match='Seed 0'):
+    accept[0] = False
+    with pytest.raises(RuntimeError, match='2s feasibility.*Seed 0.*Seed 1.*Seed 2'):
         runner.execute(tmp_path, tmp_path, tmp_path / 'failed', preflight_only=True)
     assert not (tmp_path / 'failed/analysis/FEASIBILITY_SUCCESS.json').exists()
     assert (tmp_path / 'failed/analysis/preflight.json').is_file()
+    gates = json.loads((tmp_path / 'failed/analysis/feasibility_gates.json').read_text())
+    assert not gates['passed'] and all(not row['passed'] for row in gates['seeds'].values())
+    assert 'FAILED' in (tmp_path / 'failed/analysis/feasibility_report.md').read_text()
+    assert not (tmp_path / 'failed/analysis/task_results').exists()
 
 
 def test_stdlib_feasibility_bundle(tmp_path):
@@ -263,12 +317,15 @@ def test_stdlib_feasibility_bundle(tmp_path):
     native = root.parent / 'fhp_ucv_escher/fhp-ucv-escher-experiments'
     if not (native / 'fhp_escher/checkpointing.py').is_file():
         pytest.skip('Native checkout not installed')
-    proc = subprocess.run([sys.executable, '-S', str(root / 'gcp/exp23_ucv_flop_resolving_batch.py'),
-                           'prepare', '--mode', 'feasibility', '--project', 'clever-overview-399515',
+    common = ['--project', 'clever-overview-399515',
                            '--region', 'europe-west1', '--bucket', 'gs://clever-overview-399515-fhp-escher-results',
                            '--service-account', 'fhp-escher-runner@clever-overview-399515.iam.gserviceaccount.com',
                            '--run-id', 'exp23-search-feasibility-test', '--native-repo', str(native),
-                           '--run-dir', str(tmp_path / 'batch')], capture_output=True, text=True, timeout=30)
+                           '--run-dir', str(tmp_path / 'batch')]
+    # With no mode set, preparation must default to the small two-second test.
+    env = {k: v for k, v in os.environ.items() if k != 'EXP23_MODE'}
+    launcher = [sys.executable, '-S', str(root / 'gcp/exp23_ucv_flop_resolving_batch.py')]
+    proc = subprocess.run([*launcher, 'prepare', *common], env=env, capture_output=True, text=True, timeout=30)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     request = json.loads((tmp_path / 'batch/request.json').read_text())
     job = json.loads((tmp_path / 'batch/job.json').read_text())
@@ -277,5 +334,50 @@ def test_stdlib_feasibility_bundle(tmp_path):
     assert task['maxRunDuration'] == '3600s'
     assert task['environment']['variables']['FHP_SEARCH_MODE'] == 'feasibility'
     assert '--preflight-only' in task['runnables'][0]['script']['text']
-    assert request['experiment']['search_seconds'] == .5
+    assert request['experiment'] == config('feasibility')
+    assert request['experiment']['search_seconds'] == 2.
+    assert request['experiment']['maximum_latency_seconds'] == 4.
     assert request['experiment']['minimum_acceptance_rate'] == .1
+    assert job['labels']['search_budget'] == '2s'
+    assert task['runnables'][0]['timeout'] == '2700s'
+    assert 'SEARCH_TIMEOUT=600' in task['runnables'][0]['script']['text']
+    assert 'mode=feasibility, search budget=2s' in proc.stdout
+    # Never let the new wrapper submit a stale 500ms request. This must fail
+    # locally, before making any gcloud calls or spending cloud compute.
+    request['experiment'] = config('gameplay')
+    (tmp_path / 'batch/request.json').write_text(json.dumps(request))
+    proc = subprocess.run([*launcher, 'submit', *common], env=env, capture_output=True, text=True, timeout=30)
+    assert proc.returncode != 0 and 'old 500ms bundle' in proc.stderr
+
+
+def test_failed_probe_violation_tails():
+    from fhp_evaluation.resolving.runner import timing_summary
+    traces = [dict(accepted=False, total_seconds=1.99, budget_seconds=2., checks=100, iterations=100,
+                   best_rejected_max_increase_bb=x, preparation_completed=True,
+                   reason='no_verified_improvement') for x in (.01, .02, .03)]
+    traces += [dict(traces[0], accepted=True, best_rejected_max_increase_bb=1., reason='verified')]
+    summary = timing_summary(traces)
+    assert summary['accepted'] == 1 and summary['acceptance_rate'] == .25
+    assert summary['mean_checks'] == 100
+    tail = summary['failed_probe_best_violation_bb']
+    assert tail['n'] == 3 and tail['median'] == .02 and tail['maximum'] == .03
+
+
+def test_repo_root_wrapper_two_second_prepare(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    native = root.parent / 'fhp_ucv_escher/fhp-ucv-escher-experiments'
+    wrapper = native / 'gcp/run_exp23_flop_resolving.sh'
+    if not wrapper.is_file():
+        pytest.skip('Native checkout not installed')
+    env = dict(os.environ, PROJECT_ID='clever-overview-399515', REGION='europe-west1',
+               BUCKET='gs://clever-overview-399515-fhp-escher-results',
+               SA_EMAIL='fhp-escher-runner@clever-overview-399515.iam.gserviceaccount.com',
+               RUN_ID='exp23-search-wrapper-test', EXP23_MODE='feasibility',
+               FHP_EVALUATION_SUITE=str(root), EXP23_RUN_DIR=str(tmp_path / 'bundle'), PYTHON=sys.executable)
+    proc = subprocess.run(['bash', str(wrapper), 'prepare'], cwd=native, env=env,
+                          capture_output=True, text=True, timeout=30)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    request = json.loads((tmp_path / 'bundle/request.json').read_text())
+    assert request['experiment'] == config('feasibility')
+    assert 'search budget=2s' in proc.stdout
+    assert request['source']['source_only']

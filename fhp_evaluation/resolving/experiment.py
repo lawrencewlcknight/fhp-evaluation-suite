@@ -35,13 +35,20 @@ def checkpoint_registry():
     return result
 
 
-def config():
+def config(mode="gameplay"):
+    if mode not in ("gameplay", "feasibility"):
+        raise ValueError("Expected gameplay or feasibility mode")
+    # The two-second development probe is deliberately separate from the
+    # original gameplay protocol. Passing it never launches/retunes gameplay.
+    search_seconds = 2. if mode == "feasibility" else .5
     return dict(protocol=PROTOCOL, experiment=23, training_seeds=[0, 1, 2],
-                search_seconds=.5, max_iterations=10000, pairs_per_match=5000,
+                search_seconds=search_seconds, max_iterations=10000, pairs_per_match=5000,
                 pairs_per_shard=250, processes=4, torch_threads=4, batch_size=1024,
                 evaluation_seed=20261011, preflight_seed=20261012,
                 preflight_positions_per_seed=24, minimum_acceptance_rate=.10,
-                maximum_overrun_rate=.05, maximum_latency_seconds=1.,
+                # A pathological-latency guard, NOT permission to deploy late
+                # results: all results exceeding search_seconds still fall back.
+                maximum_overrun_rate=.05, maximum_latency_seconds=2 * search_seconds,
                 policy_shift_threshold=1e-6, certificate_tolerance_bb=1e-8,
                 primary="search_vs_own_blueprint_mbb_per_hand",
                 secondary="equal_weight_external_panel_paired_uplift_mbb_per_hand",

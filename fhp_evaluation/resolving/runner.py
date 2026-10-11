@@ -73,7 +73,12 @@ def timing_summary(traces):
     values = np.asarray([t["total_seconds"] for t in traces])
     decisions = sum(t.get("flop_decisions", 0) for t in traces)
     stages = sorted({name for t in traces for name in t.get("stage_seconds", {})})
-    return dict(attempts=len(traces), acceptance_rate=float(np.mean([t["accepted"] for t in traces])),
+    rejected = [t["best_rejected_max_increase_bb"] for t in traces
+                if not t["accepted"] and t.get("best_rejected_max_increase_bb") is not None]
+    violation = (dict(n=len(rejected), minimum=float(np.min(rejected)), median=float(np.median(rejected)),
+                      p95=float(np.quantile(rejected, .95)), maximum=float(np.max(rejected))) if rejected else None)
+    return dict(attempts=len(traces), accepted=sum(bool(t["accepted"]) for t in traces),
+                acceptance_rate=float(np.mean([t["accepted"] for t in traces])),
                 preparation_completed=sum(t.get("preparation_completed", False) for t in traces),
                 mean_preparation_seconds=float(np.mean([t.get("preparation_seconds", 0.) for t in traces])),
                 mean_stage_seconds={name: float(np.mean([t.get("stage_seconds", {}).get(name, 0.) for t in traces])) for name in stages},
@@ -84,15 +89,75 @@ def timing_summary(traces):
                 maximum_seconds=float(values.max()), median_seconds=float(np.median(values)),
                 p95_seconds=float(np.quantile(values, .95)), p99_seconds=float(np.quantile(values, .99)),
                 mean_iterations=float(np.mean([t["iterations"] for t in traces])),
+                minimum_iterations=min(t["iterations"] for t in traces),
+                maximum_iterations=max(t["iterations"] for t in traces),
+                mean_checks=float(np.mean([t.get("checks", 0) for t in traces])),
+                failed_probe_best_violation_bb=violation,
                 reasons=dict(Counter(t["reason"] for t in traces)))
 
 
 def enforce_gate(summary, spec):
-    if (summary["attempts"] == 0 or summary["acceptance_rate"] < spec["minimum_acceptance_rate"]
+    metrics = [summary[k] for k in ("attempts", "acceptance_rate", "overrun_rate", "maximum_seconds")]
+    if (not np.isfinite(metrics).all() or summary["attempts"] <= 0
+            or not 0 <= summary["acceptance_rate"] <= 1 or not 0 <= summary["overrun_rate"] <= 1
+            or summary["maximum_seconds"] < 0
+            or summary["acceptance_rate"] < spec["minimum_acceptance_rate"]
             or summary["overrun_rate"] > spec["maximum_overrun_rate"]
             or summary["maximum_seconds"] > spec["maximum_latency_seconds"]):
-        raise RuntimeError("500ms feasibility gate failed; inspect timing/acceptance diagnostics. "
+        raise RuntimeError(f"{spec['search_seconds']:g}s feasibility gate failed "
+                           f"(acceptance >= {spec['minimum_acceptance_rate']:.0%}, "
+                           f"overruns <= {spec['maximum_overrun_rate']:.0%}, "
+                           f"maximum latency <= {spec['maximum_latency_seconds']:g}s). "
                            "Do not interpret mostly-fallback play as a negative search result or raise the budget silently.")
+
+
+def assess_gates(summaries, spec):
+    """Retain every seed's failure, rather than hiding all but the first one."""
+    seeds = {}
+    for seed, row in summaries.items():
+        try:
+            enforce_gate(row, spec)
+            seeds[seed] = dict(passed=True, error=None)
+        except RuntimeError as exc:
+            seeds[seed] = dict(passed=False, error=str(exc))
+    return dict(passed=bool(seeds) and all(s["passed"] for s in seeds.values()), seeds=seeds,
+                search_seconds=spec["search_seconds"], maximum_latency_seconds=spec["maximum_latency_seconds"],
+                minimum_acceptance_rate=spec["minimum_acceptance_rate"],
+                maximum_overrun_rate=spec["maximum_overrun_rate"])
+
+
+def write_preflight_report(analysis, summaries, gates):
+    text = ["# Experiment 23: flop-search feasibility", "",
+            f"Search budget: {gates['search_seconds']:g} seconds per public-flop entry. "
+            f"Overall gate: {'PASSED' if gates['passed'] else 'FAILED'}.", "",
+            "This report measures verified-change coverage and cost, not playing strength or whole-game exploitability.", "",
+            "| Seed | Accepted / probes | Rate | Mean iterations | Preparation complete | Overruns | Median / p95 / max seconds | Gate |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- |"]
+    for seed, row in summaries.items():
+        text.append(f"| {seed} | {row['accepted']} / {row['attempts']} | {row['acceptance_rate']:.1%} | "
+                    f"{row['mean_iterations']:.1f} | {row['preparation_completed']} / {row['attempts']} | "
+                    f"{row['overrun_rate']:.1%} | {row['median_seconds']:.4f} / {row['p95_seconds']:.4f} / "
+                    f"{row['maximum_seconds']:.4f} | {'PASS' if gates['seeds'][seed]['passed'] else 'FAIL'} |")
+    text += ["", "## Limits and interpretation", "",
+             f"Each seed must accept at least {gates['minimum_acceptance_rate']:.0%} of probes. "
+             f"At most {gates['maximum_overrun_rate']:.0%} may overrun the search budget; "
+             f"none may exceed the separate {gates['maximum_latency_seconds']:g}s pathological-latency guard.",
+             "Late strategies are never deployed. The per-opponent-hand certificate tolerance remains 1e-8 BB; "
+             "the strategy-change threshold remains 1e-6.", "",
+             "All seeds and public probe positions match the earlier 500ms test. More computation alone is changed. "
+             "Acceptance does not imply a head-to-head gain. A failed gate is a completed negative feasibility "
+             "result, but the job intentionally exits nonzero and never starts gameplay in feasibility mode.", "",
+             "preflight.json retains every position, stage timings, iteration counts and the smallest maximum "
+             "per-hand violation found among rejected candidates; these are not whole-game exploitability values.", ""]
+    for seed, row in summaries.items():
+        violation = row.get("failed_probe_best_violation_bb")
+        if violation:
+            text.append(f"- Seed {seed}: among {violation['n']} failed probes with rejected candidates, "
+                        f"best maximum per-hand violation median/p95/max = {violation['median']:.6g} / "
+                        f"{violation['p95']:.6g} / {violation['maximum']:.6g} BB.")
+    temporary = analysis / "feasibility_report.md.tmp"
+    temporary.write_text("\n".join(text) + "\n")
+    os.replace(temporary, analysis / "feasibility_report.md")
 
 
 def preflight_task(row, input_root, native_root, spec):
@@ -253,7 +318,7 @@ def write_report(analysis, result):
 
 
 def execute(input_root, native_root, output, *, preflight_only=False):
-    spec = config()
+    spec = config("feasibility" if preflight_only else "gameplay")
     output = Path(output)
     analysis = output / "analysis"
     analysis.mkdir(parents=True, exist_ok=True)
@@ -288,7 +353,9 @@ def execute(input_root, native_root, output, *, preflight_only=False):
                     write_json(analysis / "preparation_profile.json", dict(
                         records=profiles, all_fixed_work_checks_passed=all(p["passed"] for p in profiles),
                         note="Uncapped fixed-work profiling, not gameplay latency. Native feature caches disabled; "
-                             "legacy/vectorized order alternated. Gate below retains the unchanged 500ms budget."))
+                             f"legacy/vectorized order alternated. Timed probes use {spec['search_seconds']:g}s."))
+                    if not all(p["passed"] for p in profiles):
+                        raise RuntimeError("Fixed-work preparation parity failed")
                 # Four concurrently loaded workers, as in gameplay. Rechecked on recovery.
                 checks = [(seed, index) for index in range(spec["preflight_positions_per_seed"])
                           for seed in spec["training_seeds"]]
@@ -297,12 +364,20 @@ def execute(input_root, native_root, output, *, preflight_only=False):
                 summaries = {str(seed): timing_summary([p for p in probes if p["seed"] == seed])
                              for seed in spec["training_seeds"]}
                 write_json(analysis / "preflight.json", dict(probes=probes, timing_by_seed=summaries))
+                gates = assess_gates(summaries, spec)
+                write_json(analysis / "feasibility_gates.json", gates)
+                write_preflight_report(analysis, summaries, gates)
                 for seed, row in summaries.items():
-                    try:
-                        enforce_gate(row, spec)
-                    except RuntimeError as exc:
-                        raise RuntimeError(f"Seed {seed}: accepted {row['acceptance_rate']:.1%}, "
-                                           f"overall deadline overruns {row['overrun_rate']:.1%}. {exc}") from exc
+                    print(f"Seed {seed}: {row['accepted']}/{row['attempts']} accepted; "
+                          f"{row['mean_iterations']:.1f} mean iterations; "
+                          f"{row['overrun_rate']:.1%} overruns; gate "
+                          f"{'PASS' if gates['seeds'][seed]['passed'] else 'FAIL'}", flush=True)
+                if not gates["passed"]:
+                    failures = [f"Seed {seed}: accepted {summaries[seed]['acceptance_rate']:.1%}, "
+                                f"overall deadline overruns {summaries[seed]['overrun_rate']:.1%}"
+                                for seed, gate in gates["seeds"].items() if not gate["passed"]]
+                    raise RuntimeError(f"{spec['search_seconds']:g}s feasibility gate failed. " +
+                                       "; ".join(failures) + ". Inspect analysis/feasibility_gates.json and feasibility_report.md.")
                 if preflight_only:
                     write_json(analysis / "FEASIBILITY_SUCCESS.json", dict(status="preflight_passed", identity=identity,
                                                                           gameplay_performed=False))

@@ -56,7 +56,9 @@ def build_job(args, bundle_hash):
         allocationPolicy=dict(serviceAccount=dict(email=args.service_account), instances=[dict(policy=dict(
             machineType="n2-standard-16", provisioningModel="STANDARD",
             bootDisk=dict(sizeGb=100, type="pd-balanced")))]),
-        logsPolicy=dict(destination="CLOUD_LOGGING"), labels=dict(workload="ucv-exp23-search"))
+        logsPolicy=dict(destination="CLOUD_LOGGING"), labels=dict(
+            workload="ucv-exp23-search", mode=args.mode,
+            search_budget="2s" if args.mode == "feasibility" else "500ms"))
 
 
 def read(*args):
@@ -99,7 +101,9 @@ def main():
     parser.add_argument("--bucket", default=os.environ.get("BUCKET"))
     parser.add_argument("--service-account", default=os.environ.get("SA_EMAIL"))
     parser.add_argument("--run-id", default=os.environ.get("RUN_ID"))
-    parser.add_argument("--mode", choices=("gameplay", "feasibility"), default=os.environ.get("EXP23_MODE", "gameplay"))
+    parser.add_argument("--mode", choices=("gameplay", "feasibility"),
+                        default=os.environ.get("EXP23_MODE", "feasibility"),
+                        help="Default: two-second feasibility only; gameplay must be explicitly selected")
     parser.add_argument("--native-repo", type=Path, default=ROOT.parent / "fhp_ucv_escher/fhp-ucv-escher-experiments")
     parser.add_argument("--run-dir", type=Path)
     parser.add_argument("--recovery-tag")
@@ -113,15 +117,19 @@ def main():
         bundle_hash = common.sha256(directory / "source.tar.gz")
         (directory / "job.json").write_text(json.dumps(build_job(args, bundle_hash), indent=2) + "\n")
         request = {f: getattr(args, f) for f in fields}
-        request.update(source=source, experiment=config(), bundle_sha256=bundle_hash,
+        request.update(source=source, experiment=config(args.mode), bundle_sha256=bundle_hash,
                        prepared_files_sha256={p: common.sha256(directory / p) for p in ("source.tar.gz", "job.json")})
         (directory / "request.json").write_text(json.dumps(request, indent=2) + "\n")
-        print(f"Prepared {directory}; no cloud calls or paid jobs. Source is bundled by hash, not REPO_REF.")
+        print(f"Prepared {directory}; mode={args.mode}, search budget={config(args.mode)['search_seconds']:g}s. "
+              "No cloud calls or paid jobs. Source is bundled by hash, not REPO_REF.")
         return
     request = json.loads((directory / "request.json").read_text())
     if any(request.get(f) != getattr(args, f) for f in fields):
         raise ValueError("Arguments differ from the prepared request (including mode); "
                          "old bundles require a fresh run ID and preparation with the updated source")
+    if request.get("experiment") != config(args.mode):
+        raise ValueError("Prepared experiment configuration differs from this launcher. "
+                         "Use a fresh run ID and prepare again; an old 500ms bundle cannot become a two-second run.")
     for name, sha in request["prepared_files_sha256"].items():
         if common.sha256(directory / name) != sha:
             raise ValueError(f"Prepared input changed: {name}")
