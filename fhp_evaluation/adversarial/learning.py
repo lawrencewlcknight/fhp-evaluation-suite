@@ -71,8 +71,10 @@ class Episode:
     reward: float
 
 
-def collect(game, learner, opponents, seats, rng, *, epsilon=0):
+def collect(game, learner, opponents, seats, rng, *, epsilon=0, reward_scale=BIG_BLIND_CHIPS):
     """Ragged hands with batched neural queries, no Python replay-row objects retained."""
+    if not np.isfinite(reward_scale) or reward_scale <= 0:
+        raise ValueError("Positive finite reward scale required")
     count = len(seats)
     if len(opponents) != count or any(s not in (0, 1) for s in seats):
         raise ValueError("One legal learning seat and opponent per hand required")
@@ -113,7 +115,7 @@ def collect(game, learner, opponents, seats, rng, *, epsilon=0):
                 if is_learner:
                     rows[i].append((x[j], masks[j], action))
                 states[i].apply_action(action)
-    return [Episode(row, float(state.returns()[seat]) / BIG_BLIND_CHIPS)
+    return [Episode(row, float(state.returns()[seat]) / reward_scale)
             for row, state, seat in zip(rows, states, seats)]
 
 
@@ -165,8 +167,18 @@ def step(optimizer, model, loss):
     optimizer.step()
 
 
+def attacker_loss(predicted, desired, kind="smooth_l1"):
+    """Half-MSE matches Smooth L1's local curvature (beta=1), not its tails."""
+    if kind == "smooth_l1":
+        return F.smooth_l1_loss(predicted, desired)
+    if kind == "half_mse":
+        return .5 * F.mse_loss(predicted, desired)
+    raise ValueError(f"Unknown attacker loss: {kind}")
+
+
 def train_attacker(game, victim, seat, seed, cfg, progress=lambda **kw: None, *,
-                   checkpoint_seconds=(), on_checkpoint=None, exploration_seconds=None):
+                   checkpoint_seconds=(), on_checkpoint=None, exploration_seconds=None,
+                   loss_kind="smooth_l1", reward_scale=BIG_BLIND_CHIPS):
     """Original Exp21 learner, with optional observational Exp26 snapshots.
 
     Snapshot I/O is excluded from the active clock. No evaluation, RNG draws or
@@ -174,6 +186,10 @@ def train_attacker(game, victim, seat, seed, cfg, progress=lambda **kw: None, *,
     schedule remains tied to cfg.attack_seconds; Exp26 fixes it to 900 seconds.
     Checkpoints are taken at completed collection/update-wave boundaries.
     """
+    if loss_kind not in ("smooth_l1", "half_mse"):
+        raise ValueError("Unknown attacker loss")
+    if not np.isfinite(reward_scale) or reward_scale <= 0:
+        raise ValueError("Positive finite reward scale required")
     checkpoints = list(checkpoint_seconds)
     if (checkpoints != sorted(set(checkpoints)) or any(t < 0 or t > cfg.attack_seconds for t in checkpoints)
             or (bool(checkpoints) != (on_checkpoint is not None))):
@@ -217,7 +233,8 @@ def train_attacker(game, victim, seat, seed, cfg, progress=lambda **kw: None, *,
         fraction = min(1., elapsed() / exploration_seconds)
         epsilon = 1. - .95 * min(1., fraction / .8)
         n = min(cfg.environments, cfg.episode_limit - hands)
-        episodes = collect(game, actor, [victim] * n, [seat] * n, rng, epsilon=epsilon)
+        episodes = collect(game, actor, [victim] * n, [seat] * n, rng, epsilon=epsilon,
+                           reward_scale=reward_scale)
         replay.append(episodes)
         hands += n
         waves += 1
@@ -226,7 +243,7 @@ def train_attacker(game, victim, seat, seed, cfg, progress=lambda **kw: None, *,
                 x, a, r, nx, nm, done = replay.sample(rng, cfg.batch_size)
                 desired = double_dqn_targets(model, target, nx, nm, r, done)
                 predicted = model(x).gather(1, a[:, None]).squeeze(1)
-                loss = F.smooth_l1_loss(predicted, desired)
+                loss = attacker_loss(predicted, desired, loss_kind)
                 step(optimizer, model, loss)
                 losses.append(float(loss.detach()))
                 updates += 1
@@ -247,7 +264,8 @@ def train_attacker(game, victim, seat, seed, cfg, progress=lambda **kw: None, *,
                    mean_last_loss=float(np.mean(losses[-100:])), hash=model_hash(model),
                    initial_hash=model_hash(initial), seat=seat, seed=seed,
                    active_seconds=elapsed(), snapshot_seconds=excluded_seconds,
-                   exploration_seconds=exploration_seconds)
+                   exploration_seconds=exploration_seconds, loss_kind=loss_kind,
+                   reward_scale=reward_scale)
     return actor, NetworkPolicy(initial, victim.feature_encoder, greedy=True), state, metrics
 
 

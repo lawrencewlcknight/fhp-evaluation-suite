@@ -46,13 +46,15 @@ def load_reference(source, native_repo):
     return game, target, NetworkPolicy(target.native.model, target.native.feature_encoder)
 
 
-def train_worker(game, reference, spec, seat, repetition, output, source_hash):
+def train_worker(game, reference, spec, seat, repetition, output, source_hash, *,
+                 training_seed=None, loss_kind="smooth_l1", reward_scale=100.):
     records = []
     checkpoints = output / "checkpoints"
     checkpoints.mkdir(exist_ok=False)
     events = Events(output / "events.jsonl")
     cfg = Config(**spec["learner"])
-    seed = training_stream(0, "qualification-train", seat, repetition)
+    seed = (training_stream(0, "qualification-train", seat, repetition)
+            if training_seed is None else training_seed)
     before = model_hash(reference.model)
 
     def snapshot(nominal, state, metrics):
@@ -67,7 +69,8 @@ def train_worker(game, reference, spec, seat, repetition, output, source_hash):
 
     _, _, _, metrics = train_attacker(game, reference, seat, seed, cfg, events,
         checkpoint_seconds=spec["checkpoints_seconds"], on_checkpoint=snapshot,
-        exploration_seconds=spec["exploration_seconds"])
+        exploration_seconds=spec["exploration_seconds"], loss_kind=loss_kind,
+        reward_scale=reward_scale)
     if [r["nominal_seconds"] for r in records] != spec["checkpoints_seconds"]:
         raise ValueError("Incomplete fixed training schedule")
     if model_hash(reference.model) != before:
@@ -150,11 +153,11 @@ def choose(curves, seconds):
     return max(candidates, key=lambda r: (r["payoff_mbb"]["mean"], -r["repetition"]))["repetition"]
 
 
-def calibration(game, policies, reference, spec):
+def calibration(game, policies, reference, spec, *, seed_for_seat=None):
     """Q versus realised greedy-policy returns; descriptive, not a BR target."""
     results = []
     for seat, policy in enumerate(policies):
-        rng = np.random.default_rng(stream("calibration", seat))
+        rng = np.random.default_rng(stream("calibration", seat) if seed_for_seat is None else seed_for_seat(seat))
         predicted, realised = [], []
         for start in range(0, spec["calibration_hands_per_seat"], 32):
             count = min(32, spec["calibration_hands_per_seat"] - start)

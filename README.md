@@ -9,6 +9,15 @@ This repository is the single evaluation implementation shared by
 - a poker-specific Local Best Response (LBR) lower-bound probe;
 - collision-free checkpoint loading for all three policy formats.
 
+## UCV Experiment 27: attacker learning controls and loss ablation
+
+[Experiment 27](docs/exp27_attacker_development.md) validates learned responses
+against weak FHP targets and an exact Leduc best-response benchmark, compares
+Smooth L1 with half-squared-error fitting, and conditionally replicates a qualified
+attacker on the other frozen Exp10 seeds. One Batch job, no automatic UCV policy
+repair and no relaxation of Experiment 21's gate. Launch from the UCV repo using
+`gcp/run_exp27_attacker_development.sh`.
+
 ## UCV Experiment 21: adversarial policy improvement
 
 The opt-in `fhp_evaluation.adversarial` package implements a staged three-seed
