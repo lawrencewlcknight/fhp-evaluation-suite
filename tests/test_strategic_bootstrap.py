@@ -1,4 +1,4 @@
-"""Regress the Exp16 cloud bootstrap without apt, Python installs or paid jobs."""
+"""Regress the UCV/SD strategic bootstraps without installs or paid jobs."""
 
 import json
 import os
@@ -15,6 +15,12 @@ SCRIPT = ROOT / "gcp/run_exp6_ucv_exp16_strategic_audit.sh"
 STAGES = ("system_packages", "bootstrap_venv", "uv_install", "python_availability",
           "managed_python", "evaluation_venv", "runtime_version", "torch_install",
           "evaluation_dependencies", "dependency_check")
+
+
+@pytest.fixture(autouse=True, params=("run_exp6_ucv_exp16_strategic_audit.sh",
+                                     "run_sd_exp6_strategic_audit.sh"))
+def strategic_script(request, monkeypatch):
+    monkeypatch.setattr(sys.modules[__name__], "SCRIPT", ROOT / "gcp" / request.param)
 
 
 def body():

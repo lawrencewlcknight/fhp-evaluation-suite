@@ -91,6 +91,10 @@ def policy_identity(item):
         manifest = json.loads(Path(item["checkpoint"]).read_text())
         value["chunk_hashes"] = {c["path"]: sha256_file(Path(item["checkpoint"]).parent / c["path"])
                                   for c in manifest["chunks"]}
+        # These cryptographic hashes supersede the cheaper BR file-stamp guard.
+        # A fresh recovery VM downloads identical chunks with new mtimes; those
+        # must not invalidate verified strategic-audit board caches.
+        value.pop("archive_file_stamps", None)
     return dict(spec=item, native=value)
 
 

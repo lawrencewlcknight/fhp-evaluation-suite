@@ -44,12 +44,15 @@ def git_provenance(root):
     return {"commit": read("rev-parse", "HEAD"), "dirty": bool(read("status", "--porcelain"))}
 
 
-def make_bundle(evaluation_root, native_root, destination, *, extra_files=()):
+def make_bundle(evaluation_root, native_root, destination, *, extra_files=(),
+                native_packages=("fhp_escher", "vr_deep_cfr")):
     evaluation_root, native_root = Path(evaluation_root).resolve(), Path(native_root).resolve()
     candidates = {}
     for source_root, prefix, packages in ((evaluation_root, "evaluator", ("fhp_evaluation",)),
-                                          (native_root, "native", ("fhp_escher", "vr_deep_cfr"))):
+                                          (native_root, "native", native_packages)):
         for package in packages:
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", package):
+                raise ValueError(f"Invalid source package name: {package}")
             package_root = source_root / package
             if package_root.is_symlink() or not (package_root / "__init__.py").is_file():
                 raise ValueError(f"Missing or symlinked source package: {package_root}")

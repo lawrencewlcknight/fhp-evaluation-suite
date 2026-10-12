@@ -31,6 +31,12 @@ does not claim certified exploitability reduction.
 
 ## Strategic-position audit
 
+The **SD-CFR Experiment 6 audit** is an SD-CFR-only evaluation of the complete
+24h/48h historical mixtures: a full-size one-board profile, an eight-board pilot,
+then a separately gated three-seed, 64-board development audit against the five
+fixed rule agents. No training or assessment access is enabled. See the
+[SD-CFR protocol and staged launch instructions](docs/sd_exp6_strategic_audit.md).
+
 The `strategic-library`, `strategic-spec`, `strategic-validate` and `strategic-run`
 commands implement a frozen, range-aware final-round diagnostic. They separate
 provable decision errors, one-decision EV gaps with fixed continuation, and
