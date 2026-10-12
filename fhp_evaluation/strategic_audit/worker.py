@@ -32,6 +32,9 @@ def export(spec):
     else:
         adapter = load_target(game, item["checkpoint"], family=item["family"], repo_root=item.get("repo_root"),
                               batch_size=item.get("batch_size", 1024), model_batch_size=item.get("model_batch_size", 32))
+    if item.get("deployment") is not None:
+        from ..safeguard.policy import deploy
+        adapter = deploy(game, adapter, item["deployment"])
     for board in spec["boards"]:
         output = Path(spec["cache"]) / board_key(board)
         if completed(output, spec["identity"], "tables.npz"):

@@ -9,6 +9,15 @@ This repository is the single evaluation implementation shared by
 - a poker-specific Local Best Response (LBR) lower-bound probe;
 - collision-free checkpoint loading for all three policy formats.
 
+## UCV Experiment 34: exact terminal-call safeguard
+
+[Experiment 34](docs/exp34_terminal_call_safeguard.md) compares the three frozen
+Experiment 16 48-hour policies with and without an exact terminal-call safeguard.
+It includes large paired matches, the rule/temporal/neural panels, target-aware
+LBR and full-flop cross-probes, strategic diagnostics and latency measurements.
+No policy retraining or source-checkpoint mutation. The UCV root launcher is
+`gcp/run_exp34_terminal_call_safeguard.sh`; smoke is the default, full is opt-in.
+
 ## UCV Experiment 27: attacker learning controls and loss ablation
 
 [Experiment 27](docs/exp27_attacker_development.md) validates learned responses

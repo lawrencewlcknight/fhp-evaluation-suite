@@ -37,6 +37,8 @@ def validate_spec(spec):
         if not re.fullmatch(r"[A-Za-z0-9_-]+", label):
             raise ValueError("Policy ids must be filesystem-safe")
         family = item["family"]
+        if item.get("deployment") not in (None, "exact_terminal_call_v1"):
+            raise ValueError("Unknown deployment safeguard")
         if family not in ("ucv", "vr_deep", "sd_cfr", "raw_mlp", "control", "rule"):
             raise ValueError("Unknown policy family")
         if family == "rule" and item.get("name") not in PUBLISHED_AGENT_NAMES:
