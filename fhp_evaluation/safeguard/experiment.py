@@ -28,8 +28,8 @@ def config(mode):
                 stream_seed=202610130034, response_seed=202610140034,
                 strategic_stage="development" if full else "pilot",
                 session_seconds=46*3600 if full else 1800,
-                # Engineering gate before the large study, never a payoff-based stop.
-                max_projected_gameplay_hours=28., projection_margin=2., profile_pairs=16)
+                # Advisory estimate only; the unchanged Batch/session limits bound cost.
+                gameplay_planning_hours=30., projection_margin=2., profile_shards_per_matchup=2)
 
 
 def opponents(spec, seed):
@@ -58,6 +58,22 @@ def tasks(spec):
             for start in range(0, n, step):
                 yield dict(seed=seed, opponent=opponent, start=start, count=min(step, n-start),
                            id=f"s{seed}_{opponent}_{start:07d}")
+
+
+def profiling_tasks(spec):
+    """First two production shards per matchup, retained in the final sample.
+
+    Selection is fixed before play and independent of outcomes. Use normal shard
+    sizes (including response shards) so inference batching is representative.
+    Interleave the repeats rather than timing one matchup twice immediately.
+    """
+    selected = []
+    for task in tasks(spec):
+        step = spec["response_shard_pairs"] if is_response(task["opponent"]) else spec["shard_pairs"]
+        repeat = task["start"] // step
+        if repeat < spec["profile_shards_per_matchup"]:
+            selected.append((repeat, task))
+    return [task for _, task in sorted(selected, key=lambda item: item[0])]
 
 
 def stream_seed(spec, seed, opponent, pair):

@@ -20,7 +20,7 @@ from ..loaders import sha256_file
 from ..resolving.runner import worker_pool, initialise
 from ..rule_agents import published_rule_agents
 from ..strategic_audit.workflow import exclusive
-from .experiment import config, count, is_response, opponents, tasks
+from .experiment import config, count, is_response, profiling_tasks, tasks
 from .matches import COLUMNS, paired_matches
 from .policy import ExactCallSafeguard
 from .report import aggregate, describe, write_report
@@ -100,24 +100,46 @@ def run_tasks(schedule, args, spec, folder, fingerprint, deadline):
 
 
 def profile(args, spec, fingerprint, deadline):
-    profile_spec = dict(spec, stream_seed=spec["stream_seed"]+91819)
-    schedule = [dict(seed=s, opponent=o, start=0, count=spec["profile_pairs"], id=f"profile_s{s}_{o}")
-                for s in spec["seeds"] for o in opponents(spec, s)]
-    folder = args.output / "profile"
-    run_tasks(schedule, args, profile_spec, folder, fingerprint, deadline)
+    started = time.monotonic()
+    schedule = profiling_tasks(spec)
+    # These are real production shards, not disposable timing-only games. The
+    # main task pass and subsequent recoveries verify and skip them as usual.
+    folder = args.output / "task_results"
+    run_tasks(schedule, args, spec, folder, fingerprint, deadline)
     records = [json.loads((folder / row["id"] / "result.json").read_text()) for row in schedule]
-    seconds = sum(r["seconds"] / r["task"]["count"] * count(spec, r["task"]["seed"], r["task"]["opponent"])
-                  for r in records)
-    projected = spec["projection_margin"] * seconds / spec["processes"] / 3600
-    result = dict(projected_gameplay_hours=projected, safety_multiplier=spec["projection_margin"],
-                  allowed_gameplay_hours=spec["max_projected_gameplay_hours"],
-                  passed=projected <= spec["max_projected_gameplay_hours"],
-                  note="Timing-only gate on disjoint deals. Includes all response probes; excludes strategic audit/setup. "
-                       "No data-dependent reduction in the prespecified number of games.", records=records)
+    grouped = defaultdict(list)
+    for record in records:
+        grouped[(record["task"]["seed"], record["task"]["opponent"])].append(record)
+    matchups = []
+    for (seed, opponent), rows in grouped.items():
+        pairs = sum(r["task"]["count"] for r in rows)
+        seconds = sum(r["seconds"] for r in rows)
+        rates = [r["seconds"] / r["task"]["count"] for r in rows]
+        matchups.append(dict(seed=seed, opponent=opponent, measured_shards=len(rows), measured_pairs=pairs,
+            measured_worker_seconds=seconds, worker_seconds_per_pair=seconds/pairs,
+            min_shard_seconds_per_pair=min(rates), max_shard_seconds_per_pair=max(rates),
+            projected_worker_seconds=seconds/pairs*count(spec, seed, opponent)))
+    unpadded = sum(r["projected_worker_seconds"] for r in matchups) / spec["processes"] / 3600
+    projected = spec["projection_margin"] * unpadded
+    within_target = projected <= spec["gameplay_planning_hours"]
+    result = dict(projected_gameplay_hours=projected, unpadded_gameplay_hours=unpadded,
+                  safety_multiplier=spec["projection_margin"], planning_gameplay_hours=spec["gameplay_planning_hours"],
+                  within_planning_target=within_target, advisory_only=True, decision="continue",
+                  measured_pairs_retained=sum(r["measured_pairs"] for r in matchups),
+                  profiling_invocation_seconds=time.monotonic()-started,
+                  session_hours_remaining=max(0., deadline-time.monotonic())/3600,
+                  note="Advisory forecast from repeated production shards, retained in the fixed final sample. "
+                       "Includes response probes and worker model loading; excludes strategic audit/setup. "
+                       "Repeat ranges are diagnostics, not confidence intervals. No sample-size reduction or "
+                       "forecast-based abort; actual session/Batch limits still apply.",
+                  matchups=matchups, records=records)
     write_json(args.output / "analysis/profile.json", result)
-    if not result["passed"]:
-        raise RuntimeError("Projected gameplay exceeds the fixed engineering budget. Review profile.json; "
-                           "no main gameplay started and no sample size was silently reduced.")
+    print(json.dumps(dict(event="runtime_forecast", decision="continue", advisory_only=True,
+        level="info" if within_target else "warning", projected_gameplay_hours=projected,
+        unpadded_gameplay_hours=unpadded, planning_gameplay_hours=spec["gameplay_planning_hours"],
+        measured_pairs_retained=result["measured_pairs_retained"],
+        message="Continuing the unchanged evaluation sample within the existing wall-clock cap.")), flush=True)
+    return result
 
 
 def strategic_spec(spec, input_root, native_root):
@@ -153,7 +175,7 @@ def run_strategic(args, spec, deadline):
         raise TimeoutError("Session budget exhausted before strategic audit; recover this run")
     path = run(strategic_spec(spec, args.input_root, args.native_root), library, root,
                include_reference=True, resume=(root / "manifest.json").exists(), threads=4,
-               max_seconds=min(remaining, 18*3600), max_rss_mb=48000)
+               max_seconds=remaining, max_rss_mb=48000)
     result = json.loads(path.read_text())
     paired = {}
     for label, row in result["comparisons"].items():

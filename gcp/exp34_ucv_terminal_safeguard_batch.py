@@ -151,7 +151,8 @@ def main():
                     "--location", args.region, "--config", str(directory / "job.json")], check=True, timeout=180)
     print(f"Submitted {job_id}. Mode: {args.mode}. " + (
         "Small end-to-end smoke; no training." if args.mode == "smoke" else
-        "One VM runs checks, timing gate, paired games, and strategic audit. No training."))
+        "One VM runs checks, reusable timing batches, paired games, and strategic audit. "
+        "Runtime forecasts are advisory; the 48-hour cap remains. No training."))
 
 
 if __name__ == "__main__":
