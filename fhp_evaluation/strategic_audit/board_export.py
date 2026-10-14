@@ -4,7 +4,7 @@ Each task uses the existing isolated worker with exactly one board. Only the
 coordinator owns the directory lock; tasks never share writable board paths.
 No completed marker means no reusable board. No automatic retries are made.
 """
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 import sys
 import threading
@@ -39,12 +39,7 @@ def next_attempt(root):
 
 def export_boards(provenance, boards, directory, fingerprint, config, *, deadline,
                   max_rss_mb, completed):
-    """Run deterministic waves and publish timing/progress after every wave.
-
-    The first wave is a real-archive parallel-throughput measurement, not a
-    synthetic speedup claim. Benchmark the same frozen panel in a fresh run
-    with workers=1/2/4 to compare allocations. Never infer strength from timings.
-    """
+    """Keep slots occupied; checkpoint each completion, never retry in place."""
     directory = Path(directory)
     policies = provenance["policies"]
     spec = provenance["spec"]["policies"]
@@ -62,10 +57,11 @@ def export_boards(provenance, boards, directory, fingerprint, config, *, deadlin
     report = dict(identity=fingerprint, config=config, status="running",
                   total_boards=total, initial_cached_boards=initial_cached,
                   completed_boards=initial_cached, remaining_boards=len(tasks), waves=[],
+                  scheduler="rolling_v1", tasks=[], failures=[],
                   per_worker_rss_limit_mb=max_rss_mb // config["workers"],
                   worker_memory_budget_mb=max_rss_mb,
                   note="Board-task timing, including startup and archive validation. "
-                       "First wave measures actual parallel throughput, not a controlled serial speedup.")
+                       "Rolling scheduling; waves is a legacy completion-event view, not concurrent waves.")
     cancelled = threading.Event()
     def publish(status):
         report.update(status=status, elapsed_seconds=time.monotonic() - started)
@@ -73,6 +69,7 @@ def export_boards(provenance, boards, directory, fingerprint, config, *, deadlin
         write_json(directory / "export_progress.json", report)
 
     def execute(task, seconds):
+        task_started = time.monotonic() - started
         label, board = task
         cache = directory / "tables" / label
         attempt = next_attempt(directory / "workers" / label / board_key(board))
@@ -86,59 +83,60 @@ def export_boards(provenance, boards, directory, fingerprint, config, *, deadlin
                                       str(attempt / "spec.json")])
         return dict(policy=label, board=list(board), attempt=str(attempt.relative_to(directory)),
                     status=result["status"], elapsed_seconds=result.get("elapsed_seconds"),
-                    peak_rss_bytes=result.get("peak_rss_bytes"), max_seconds=seconds)
+                    peak_rss_bytes=result.get("peak_rss_bytes"), max_seconds=seconds,
+                    started_seconds=task_started, finished_seconds=time.monotonic() - started)
 
     publish("running")
-    while tasks:
-        wave = tasks[:config["workers"]]
-        families = {spec[label]["family"] for label, _ in wave}
-        remaining = deadline - time.monotonic()
-        # Do not spend the last few minutes starting a large native archive.
-        # Reserve the slowest observed comparable family plus 20%; an expensive
-        # SD wave must not prevent short single-network exports from starting.
-        observed = [r["elapsed_seconds"] for w in report["waves"] for r in w["tasks"]
-                    if r["status"] == "succeeded" and r["elapsed_seconds"] is not None
-                    and spec[r["policy"]]["family"] in families]
-        minimum = min(config["task_seconds"], max(300., 1.2 * max(observed, default=0.)))
-        if remaining < minimum:
-            publish("deferred_time_budget")
-            raise AuditDeferred("Board export reached its invocation budget; resume with identical inputs.")
-        wave_started = time.monotonic()
-        seconds = min(float(config["task_seconds"]), remaining)
-        try:
-            with ThreadPoolExecutor(max_workers=config["workers"]) as pool:
-                futures = [pool.submit(execute, task, seconds) for task in wave]
-                try:
-                    results = [future.result() for future in futures]
-                except BaseException:
-                    cancelled.set()  # Stop only this wave's owned process groups.
-                    raise
-            for row in results:
+    pending = {}
+    pool = ThreadPoolExecutor(max_workers=config["workers"])
+    try:
+        while tasks or pending:
+            while tasks and len(pending) < config["workers"]:
+                remaining = deadline - time.monotonic()
+                family = spec[tasks[0][0]]["family"]
+                observed = [r["elapsed_seconds"] for r in report["tasks"]
+                            if r["status"] == "succeeded" and r["elapsed_seconds"] is not None
+                            and spec[r["policy"]]["family"] == family]
+                minimum = min(config["task_seconds"], max(300., 1.2 * max(observed, default=0.)))
+                if remaining < minimum:
+                    break
+                task = tasks.pop(0)
+                future = pool.submit(execute, task, min(float(config["task_seconds"]), remaining))
+                pending[future] = task
+            if not pending:
+                break
+            finished, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in finished:
+                pending.pop(future)
+                row = future.result()
                 path = directory / "tables" / row["policy"] / board_key(row["board"])
                 if row["status"] == "succeeded" and not completed(path, fingerprint, "tables.npz"):
                     row["status"] = "missing_verified_board"
-        except BaseException:
-            publish("failed")
-            raise
-        elapsed = time.monotonic() - wave_started
-        succeeded = sum(r["status"] == "succeeded" for r in results)
-        report["waves"].append(dict(tasks=results, elapsed_seconds=elapsed,
-                                   completed_boards=succeeded,
-                                   boards_per_hour=succeeded * 3600 / elapsed if elapsed > 0 else None,
-                                   # Sum of separate peaks is a conservative upper bound,
-                                   # not a measured simultaneous process-tree peak.
-                                   sum_worker_peak_rss_bytes=sum(r["peak_rss_bytes"] or 0 for r in results)))
-        report["completed_boards"] += succeeded
-        report["remaining_boards"] -= succeeded
-        failures = [r for r in results if r["status"] != "succeeded"]
-        if failures:
-            if all(r["status"] == "time_limit" and r["max_seconds"] < config["task_seconds"]
-                   for r in failures):
-                publish("deferred_time_budget")
-                raise AuditDeferred("Invocation budget expired during export; completed boards are reusable.")
-            publish("failed")
-            raise RuntimeError(f"Board export failed: {failures}. See the named task run.json/stderr.log.")
-        tasks = tasks[len(wave):]
-        publish("running")
+                report["tasks"].append(row)
+                succeeded = int(row["status"] == "succeeded")
+                report["completed_boards"] += succeeded
+                report["remaining_boards"] -= succeeded
+                if not succeeded:
+                    report["failures"].append(row)
+                # Legacy readers flatten waves; these are individual completions now.
+                report["waves"].append(dict(tasks=[row], completed_boards=succeeded,
+                    elapsed_seconds=row["elapsed_seconds"],
+                    boards_per_hour=3600 / row["elapsed_seconds"] if succeeded and row["elapsed_seconds"] else None))
+                publish("running_with_failures" if report["failures"] else "running")
+    except BaseException:
+        cancelled.set()
+        publish("failed")
+        raise
+    finally:
+        pool.shutdown(wait=True)
+    failures = report["failures"]
+    hard_failures = [r for r in failures if not (r["status"] == "time_limit"
+                     and r["max_seconds"] < config["task_seconds"])]
+    if hard_failures:
+        publish("failed")
+        raise RuntimeError(f"Board export failed: {hard_failures}. See the named task run.json/stderr.log.")
+    if tasks or failures:
+        publish("deferred_time_budget")
+        raise AuditDeferred("Invocation budget expired; resume verified completed boards with identical inputs.")
     publish("complete")
     return report

@@ -91,8 +91,28 @@ class PolicyAdapter:
         row = self.batch_probabilities([state], player)[0]
         return {a: float(row[a]) for a in state.legal_actions(player)}
 
+    def sd_float64_copy(self):
+        """Same verified archive and formula, fresh caches, explicit double inference.
+
+        Do not just replace the reference or loosen a tolerance: both paths and
+        subsequent production queries must use the new precision together.
+        """
+        if self.backend != "sd_cfr" or self.native.device.type != "cpu":
+            raise ValueError("This numerical fallback is only validated for CPU SD-CFR")
+        from deep_cfr_poker.sd_cfr_disk import DiskBehaviouralPolicy
+        from deep_cfr_poker.sd_cfr_lbr import BatchedDiskBehaviouralPolicy
+        reader, game = self.native.reader, self.native.game
+        native = BatchedDiskBehaviouralPolicy(reader, game, model_batch_size=self.native.batch_size,
+            state_batch_size=self.native.state_batch_size, cache_size=self.native.cache_size,
+            device="cpu", inference_precision="float64")
+        reference = DiskBehaviouralPolicy(reader, game, model_batch_size=self.native.batch_size,
+            cache_size=self.native.cache_size, inference_precision="float64")
+        return PolicyAdapter(native, reference=reference, backend="sd_cfr", batch_size=self.batch_size,
+                             metadata=dict(self.metadata, inference_precision="float64"))
+
     def check_scalar_parity(self, states, tolerance=3e-6):
         maximum = 0.
+        worst = None
         for player in (0, 1):
             selected = [s for s in states if s.current_player() == player]
             actual = self.batch_probabilities(selected, player)
@@ -103,9 +123,14 @@ class PolicyAdapter:
                 expected = np.asarray([raw.get(a, 0.) for a in range(3)], dtype=np.float64)
                 expected = _distributions(expected[None, :],
                                           [state.legal_actions_mask(player)])[0]
-                maximum = max(maximum, float(np.max(np.abs(row - expected))))
+                error = float(np.max(np.abs(row - expected)))
+                if error > maximum:
+                    maximum = error
+                    worst = dict(player=player, history=list(state.history()),
+                                 information_state=state.information_state_string(player),
+                                 batched=row.tolist(), scalar=expected.tolist())
         if maximum > tolerance:
-            raise ValueError(f"Native/batched policy mismatch: {maximum} > {tolerance}")
+            raise ValueError(f"Native/batched policy mismatch: {maximum} > {tolerance}; worst={worst}")
         return dict(max_absolute_error=maximum, tolerance=tolerance, passed=True)
 
     def preflop_policy(self, game, config):
@@ -181,7 +206,7 @@ def load_target(game, path, *, family, repo_root=None, batch_size=1024, model_ba
                     reference = DiskBehaviouralPolicy(reader, game, model_batch_size=model_batch_size,
                                                       cache_size=256)
                     metadata.update(models_per_player=reader.count, weighting="uniform",
-                                    archive_integrity_verified=True)
+                                    archive_integrity_verified=True, inference_precision="float32")
         finally:
             np.random.set_state(numpy_state)
         backend = "sd_cfr" if family == "sd_cfr" else "native_logits"

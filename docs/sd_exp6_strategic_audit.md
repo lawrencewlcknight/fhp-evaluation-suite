@@ -69,8 +69,11 @@ budget the 384 development exports plus rule exports and analysis. If the
 workload is impractical, stop and revise the execution plan explicitly; never
 silently shorten the strategy archive or relax the scientific panel.
 
-The next-stage submission requires both `--previous-reviewed` and a completed
-predecessor of the correct stage. Cloud preflight verifies checkpoint identity,
+By default, the next-stage submission requires both `--previous-reviewed` and a
+completed predecessor of the correct stage. An explicit `--skip-pilot` option
+allows development directly after a successful reviewed profile, accepting that
+parallel throughput has not been measured; see the direct-launch instructions below.
+Cloud preflight verifies checkpoint identity,
 the complete archive workload, runtime-report checksum, identical bundled source
 files, and successful Batch final upload. Code changes require rerunning the
 feasibility stages with that code. Keep the predecessor jobs until the next
@@ -170,7 +173,59 @@ bash gcp/run_sd_exp6_strategic_audit.sh submit --stage development \
   --run-id "$DEV_RUN_ID" --previous-run-id "$PILOT_RUN_ID" --previous-reviewed
 ```
 
+### Explicit direct development: omit the pilot after a successful profile
+
+Use this only when deliberately accepting the unmeasured parallel-throughput
+risk. It still runs **all 64 boards, all three seeds, both 24h/48h checkpoints,
+complete archives and five fixed opponents**, with the unchanged 72h Batch cap.
+It does not unlock assessment boards or submit a pilot.
+
+The direct path reuses the successful profile's **exact source archive and VM
+scripts**, not the current working tree. Local unrelated changes therefore do
+not enter this experiment. Preparation needs the profile's original
+`outputs/batch/<profile-run-id>/{request.json,source.tar.gz}` in the evaluation
+suite; use `--profile-run-dir /absolute/path` on **prepare only** if those files
+are elsewhere. Submit verifies the frozen request/bundle against the remote
+successful profile, along with the normal full-archive, runtime and Batch gates.
+Keep that profile job until the development submission has passed preflight.
+
+From the SD-CFR root, using the environment above:
+
+```bash
+export PROFILE_RUN_ID="fhp-sd6-audit-prof-20261012-164550"
+export DEV_RUN_ID="fhp-sd6-audit-dev-$(date -u '+%Y%m%d-%H%M%S')"
+
+bash gcp/run_sd_exp6_strategic_audit.sh prepare --stage development \
+  --run-id "$DEV_RUN_ID" --previous-run-id "$PROFILE_RUN_ID" \
+  --previous-reviewed --skip-pilot &&
+bash gcp/run_sd_exp6_strategic_audit.sh submit --stage development \
+  --run-id "$DEV_RUN_ID" --previous-run-id "$PROFILE_RUN_ID" \
+  --previous-reviewed --skip-pilot
+```
+
+The skipped-pilot choice is recorded in the immutable request and must also be
+repeated on `recover`, together with the same predecessor and review flag.
+
+**Historical estimate, superseded by the failed development run's timings:**
+see [the execution benchmark and revised plan](sd_exp6_execution_benchmark.md)
+before any recovery. The successful 2026-10-12 profile took
+1,576.95 seconds (26.28 minutes) for one full 35,535-model board worker. Scaling
+by the actual six archive sizes and 64 boards gives about 128 worker-hours,
+or 32 hours if four workers achieve ideal concurrent throughput. A practical
+planning allowance is **40–60 hours**, including contention, transfers, setup,
+rule exports and analysis. This is an extrapolation from one board, not a
+measured interval or completion guarantee. Different textures or poor parallel
+scaling could exceed the 72h cap. The 70h evaluation-session budget leaves a
+two-hour reserve; verified completed tables are recoverable if a bounded run
+does not finish, but recovery is manual and incurs another paid invocation.
+
 ## Progress, results and recovery
+
+For the October 2026 numerical failure and the locally tested query-grouping
+improvement, see [numerical repair and query reuse](sd_exp6_numerical_repair.md).
+The old frozen recovery request does not automatically incorporate those code
+changes; use the explicit cache-preserving continuation command documented
+there, not an unchanged retry.
 
 ```bash
 gcloud batch jobs describe "$PROFILE_RUN_ID-audit" \

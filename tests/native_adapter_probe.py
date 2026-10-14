@@ -97,6 +97,12 @@ for path in paths:
     target = load_target(game, path, family=family, repo_root=repo_root,
                          batch_size=3, model_batch_size=2)
     record = target.check_scalar_parity(states)
+    if family == "sd_cfr":
+        precise = target.sd_float64_copy()
+        record["float64_parity"] = precise.check_scalar_parity(states, tolerance=1e-10)
+        assert precise.native.reader is target.native.reader
+        assert precise.reference.inference_precision == "float64"
+        assert target.native.inference_precision == "float32"
     if family == "ucv" and path.stem.startswith("hand_board"):
         from fhp_evaluation.strategic_audit.tables import BoardContext
         from fhp_evaluation.strategic_audit.checks import check_adapter

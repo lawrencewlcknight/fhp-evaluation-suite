@@ -26,7 +26,8 @@ def args(native=None, stage="profile"):
     return argparse.Namespace(run_id="fhp-sd6-audit-test", project="clever-overview-399515",
                               region="europe-west1", bucket="gs://example-bucket",
                               service_account="runner@example-project.iam.gserviceaccount.com",
-                              native_repo=native, stage=stage, previous_run_id=None, previous_reviewed=False)
+                              native_repo=native, stage=stage, previous_run_id=None, previous_reviewed=False,
+                              skip_pilot=False, profile_run_dir=None)
 
 
 @pytest.fixture
@@ -281,6 +282,64 @@ def test_source_only_offline_prepare_and_immutable_request(native, tmp_path):
         batch.verify_request(args(native), directory)
 
 
+def test_skip_pilot_only_allows_reviewed_development(native):
+    config = args(native)
+    config.skip_pilot = True
+    for stage in ("profile", "pilot"):
+        config.stage = stage
+        with pytest.raises(ValueError, match="only valid for development"):
+            batch.validate(config, preparing=True)
+    config.stage = "development"
+    with pytest.raises(ValueError, match="previous-reviewed"):
+        batch.validate(config, preparing=True)
+    config.previous_run_id, config.previous_reviewed = "fhp-sd6-audit-profile", True
+    batch.validate(config, preparing=True)
+
+
+def test_direct_prepare_reuses_exact_profile_offline_and_records_skip(native, tmp_path):
+    profile, development = tmp_path / "profile", tmp_path / "development"
+    common = [sys.executable, str(ROOT / batch.EXTRA_FILES[0]), "prepare",
+              "--project", "clever-overview-399515", "--region", "europe-west1",
+              "--bucket", "gs://example-bucket", "--service-account",
+              "runner@example-project.iam.gserviceaccount.com", "--native-repo", str(native)]
+    env = dict(os.environ, PATH="/usr/bin:/bin")  # gcloud unavailable; both prepare steps are offline.
+    subprocess.run(common + ["--run-id", "fhp-sd6-audit-profile", "--run-dir", str(profile)],
+                   check=True, capture_output=True, text=True, env=env)
+    # Current native edits must not be bundled into a direct launch.
+    (native / "deep_cfr_poker/__init__.py").write_text("# unrelated later edit\n")
+    command = common + ["--stage", "development", "--run-id", "fhp-sd6-audit-test",
+                        "--run-dir", str(development), "--previous-run-id", "fhp-sd6-audit-profile",
+                        "--previous-reviewed", "--skip-pilot", "--profile-run-dir", str(profile)]
+    subprocess.run(command, check=True, capture_output=True, text=True, env=env)
+    assert (profile / "source.tar.gz").read_bytes() == (development / "source.tar.gz").read_bytes()
+    config = args(native, "development")
+    config.previous_run_id, config.previous_reviewed = "fhp-sd6-audit-profile", True
+    config.skip_pilot, config.profile_run_dir = True, profile
+    request = batch.verify_request(config, development)
+    assert request["skip_pilot"] is True
+    assert request["profile_request_sha256"] == experiment.sha256(profile / "request.json")
+    original = json.loads((profile / "request.json").read_text())
+    assert request["source"] == original["source"]
+    job = json.loads((development / "job.json").read_text())
+    task = job["taskGroups"][0]["taskSpec"]
+    assert task["environment"]["variables"]["FHP_STAGE"] == "development"
+    assert task["maxRunDuration"] == "259200s"
+    original_job = json.loads((profile / "job.json").read_text())
+    for new, old in zip(task["runnables"], original_job["taskGroups"][0]["taskSpec"]["runnables"]):
+        assert new["script"] == old["script"]
+    config.skip_pilot = False
+    with pytest.raises(ValueError, match="skip_pilot"):
+        batch.verify_request(config, development)
+    config.skip_pilot = True
+    # Recover accepts the same immutable request without requiring the local profile folder.
+    config.profile_run_dir = None
+    batch.verify_request(config, development)
+    config.profile_run_dir = profile
+    (profile / "source.tar.gz").write_bytes(b"corrupt")
+    with pytest.raises(ValueError, match="checksum"):
+        batch.frozen_profile(config)
+
+
 def test_sd_repository_wrapper_prepares_real_source_offline(tmp_path):
     native = os.environ.get("FHP_SD_REPO")
     if not native:
@@ -302,12 +361,16 @@ def test_sd_repository_wrapper_prepares_real_source_offline(tmp_path):
         assert all(p.endswith(".py") for p in names if p.startswith("native/"))
 
 
-@pytest.mark.parametrize("stage", ["pilot", "development"])
-def test_predecessor_gate_checks_stage_archives_runtime_and_source(monkeypatch, stage):
+@pytest.mark.parametrize("stage,skip_pilot", [("pilot", False), ("development", False), ("development", True)])
+def test_predecessor_gate_checks_stage_archives_runtime_and_source(monkeypatch, stage, skip_pilot):
     config = args(stage=stage)
+    config.skip_pilot = skip_pilot
     config.previous_run_id, config.previous_reviewed = "fhp-sd6-audit-prior", True
-    previous_stage = "profile" if stage == "pilot" else "pilot"
+    previous_stage = "profile" if stage == "pilot" or skip_pilot else "pilot"
     source = {"files": {"source.py": "digest"}}
+    previous_text = json.dumps(dict(stage=previous_stage, source=source, bundle_sha256="a" * 64))
+    request = dict(source=source, bundle_sha256="a" * 64,
+                   profile_request_sha256=hashlib.sha256(previous_text.encode()).hexdigest())
     checkpoints = experiment.checkpoint_registry(previous_stage)
     runtime = dict(experiment=experiment.EXPERIMENT, stage=previous_stage,
                    execution=experiment.execution_config(previous_stage), full_archive_exports=[
@@ -321,19 +384,28 @@ def test_predecessor_gate_checks_stage_archives_runtime_and_source(monkeypatch, 
     def read(*command):
         name = command[-1].rsplit("/", 1)[-1]
         return {"SUCCESS.json": json.dumps(success), "runtime_summary.json": runtime_text,
-                "request.json": json.dumps(dict(stage=previous_stage, source=source))}[name]
+                "request.json": previous_text}[name]
     monkeypatch.setattr(batch, "read", read)
     monkeypatch.setattr(batch, "list_jobs", lambda *a: [dict(status=dict(state="SUCCEEDED"))])
-    batch.verify_previous(config, {"source": source})
+    batch.verify_previous(config, request)
     with pytest.raises(ValueError, match="Source changed"):
-        batch.verify_previous(config, {"source": {"files": {}}})
+        batch.verify_previous(config, dict(request, source={"files": {}}))
+    if skip_pilot:
+        for key in ("bundle_sha256", "profile_request_sha256"):
+            with pytest.raises(ValueError, match="exact successful profile"):
+                batch.verify_previous(config, dict(request, **{key: "b" * 64}))
+        # Omitting the opt-in still requires a pilot, not a profile.
+        config.skip_pilot = False
+        with pytest.raises(ValueError, match="full-archive pilot"):
+            batch.verify_previous(config, request)
+        config.skip_pilot = True
     success["full_archive"] = False
     with pytest.raises(ValueError, match="full-archive"):
-        batch.verify_previous(config, {"source": source})
+        batch.verify_previous(config, request)
     success["full_archive"] = True
     success["report_sha256"]["runtime_summary.json"] = "x" * 64
     with pytest.raises(ValueError, match="checksum"):
-        batch.verify_previous(config, {"source": source})
+        batch.verify_previous(config, request)
 
 
 def test_recovery_rejects_active_attempt_or_changed_request(monkeypatch):

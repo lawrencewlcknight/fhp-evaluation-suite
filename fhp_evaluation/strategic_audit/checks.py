@@ -6,6 +6,57 @@ import numpy as np
 from ..best_response.flop import make_state
 
 
+def checked_adapter(context, adapter, *, require_suit_invariance=False, float64_fallback=False):
+    """Escalate precision only on a scalar/batched mismatch, never waive a gate.
+
+    Successful FP32 boards retain their original path. A fallback board must
+    repeat ALL checks, then use the returned FP64 adapter for all table exports.
+    If FP64 fails, propagate the error; no unchecked probabilities are accepted.
+    """
+    try:
+        checks = check_adapter(context, adapter, require_suit_invariance=require_suit_invariance)
+        return adapter, checks
+    except ValueError as error:
+        if (not float64_fallback or adapter.backend != "sd_cfr"
+                or not str(error).startswith("Native/batched policy mismatch:")):
+            raise
+        original_error = str(error)
+    precise = adapter.sd_float64_copy()
+    checks = check_adapter(context, precise, require_suit_invariance=require_suit_invariance)
+    checks["numerical_fallback"] = dict(original_error=original_error, from_precision="float32",
+        to_precision="float64", tolerance_unchanged=True,
+        scope="complete board export, both scalar and batched implementations; identical archived FP32 weights")
+    return precise, checks
+
+
+def check_exported_parity(context, adapter, tables, tolerance=3e-6):
+    """Check actual exported rows, not just a separately shaped probe batch.
+
+    These scalar queries are already cached by check_adapter, so this adds no
+    extra archive sweeps. Covers both seats and every history of the first
+    preflop entry for the first compatible hand; it is not exhaustive.
+    """
+    from .tables import key
+    pre, hand = context.entries[0], tuple(context.space.hands[0])
+    maximum = 0.
+    for node in context.trees[pre]:
+        if node.player < 0:
+            continue
+        state = make_state(context.game, context.deck, hand, node.player,
+                           board=context.space.board, preflop=pre, flop=node.path)
+        raw = adapter.reference.action_probabilities(state, node.player)
+        expected = np.array([raw.get(a, 0.) for a in range(3)], dtype=np.float64)
+        expected /= expected.sum()
+        actual = tables[key(pre, node.path)][0]
+        error = float(np.max(np.abs(expected - actual)))
+        maximum = max(maximum, error)
+        if error > tolerance:
+            raise ValueError(f"Export/reference policy mismatch: {error} > {tolerance}; "
+                             f"history={list(state.history())}; table={actual.tolist()}; scalar={expected.tolist()}")
+    return dict(passed=True, max_absolute_error=maximum, tolerance=tolerance,
+                scope="actual table rows for the existing first-hand, first-entry probe histories; not exhaustive")
+
+
 def check_adapter(context, adapter, *, require_suit_invariance=False, tolerance=3e-6):
     game, deck = context.game, context.deck
     board, hand = context.space.board, tuple(context.space.hands[0])
@@ -16,7 +67,7 @@ def check_adapter(context, adapter, *, require_suit_invariance=False, tolerance=
         if node.player >= 0:
             states.append(make_state(game, deck, hand, node.player, board=board,
                                      preflop=pre, flop=node.path))
-    parity = adapter.check_scalar_parity(states)
+    parity = adapter.check_scalar_parity(states, tolerance=tolerance)
     hidden_error = order_error = 0.
     suit_errors = []
     for player in (0, 1):

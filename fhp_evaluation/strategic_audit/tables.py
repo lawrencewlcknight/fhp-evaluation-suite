@@ -45,7 +45,11 @@ class BoardContext:
                     yield key(pre, node.path), pre, node.path, node.player, tuple(a for a, _ in node.children)
 
 
-def build_tables(context, adapter):
+def build_tables(context, adapter, *, query_order="schema"):
+    if query_order == "hand_major":
+        return build_tables_hand_major(context, adapter)
+    if query_order != "schema":
+        raise ValueError("Unknown table query order")
     tables = {}
     for name, pre, post, player, _ in context.schemas():
         values = np.empty((len(context.space.hands), 3), dtype=np.float64)
@@ -56,6 +60,38 @@ def build_tables(context, adapter):
                       for h in context.space.hands[start:start + adapter.batch_size]]
             values[start:start + len(states)] = adapter.batch_probabilities(states, player)
         tables[name] = values
+    validate_tables(context, tables)
+    return tables
+
+
+def build_tables_hand_major(context, adapter):
+    """Same complete tables, grouped so SD own-history input rows can be reused.
+
+    No cross-board or cross-model output cache. Each query batch remains bounded
+    by the existing adapter batch size. Hidden opponent cards never enter input.
+    """
+    schemas = list(context.schemas())
+    tables = {name: np.empty((len(context.space.hands), 3), dtype=np.float64)
+              for name, *_ in schemas}
+    for player in (0, 1):
+        selected = [s for s in schemas if s[3] == player]
+        states, destinations = [], []
+        def flush():
+            if states:
+                values = adapter.batch_probabilities(states, player)
+                for (name, row), value in zip(destinations, values):
+                    tables[name][row] = value
+                states.clear()
+                destinations.clear()
+        for row, hand in enumerate(context.space.hands):
+            for name, pre, post, _, _ in selected:
+                states.append(make_state(context.game, context.deck, hand, player,
+                    board=() if post is None else context.space.board,
+                    preflop=pre, flop=() if post is None else post))
+                destinations.append((name, row))
+                if len(states) == adapter.batch_size:
+                    flush()
+        flush()
     validate_tables(context, tables)
     return tables
 

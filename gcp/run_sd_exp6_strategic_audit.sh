@@ -85,9 +85,16 @@ bootstrap_stage dependency_check
 bootstrap_stage complete
 BOOTSTRAP
 export PYTHONPATH="$WORK/source/evaluator"
+IMPORT_ARGS=()
+if [[ -n "${FHP_IMPORT_SOURCE:-}" ]]; then
+  mkdir -p "$WORK/import/tables"
+  timeout 180 gcloud storage cp "$FHP_IMPORT_SOURCE/manifest.json" "$WORK/import/manifest.json"
+  timeout 1800 gcloud storage rsync --recursive "$FHP_IMPORT_SOURCE/tables" "$WORK/import/tables"
+  IMPORT_ARGS=(--import-sd-cache "$WORK/import")
+fi
 export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 VECLIB_MAXIMUM_THREADS=4
 "$WORK/venv/bin/python" --version > "$OUTPUT/python_version.txt"
 "$WORK/venv/bin/pip" freeze > "$OUTPUT/pip_freeze.txt"
 "$WORK/venv/bin/python" -m fhp_evaluation.strategic_audit.sd_exp6 \
   --stage "$FHP_STAGE" --input-root "$WORK/input" --native-root "$WORK/source/native" \
-  --output "$OUTPUT" --download
+  --output "$OUTPUT" --download "${IMPORT_ARGS[@]}"

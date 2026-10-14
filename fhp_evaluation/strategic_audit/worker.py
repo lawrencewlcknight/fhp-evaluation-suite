@@ -14,7 +14,7 @@ from ..best_response.runner import write_json
 from ..best_response.validation import FixedPolicy
 from ..game import load_fhp_game
 from ..rule_agents import published_rule_agents
-from .checks import check_adapter
+from .checks import checked_adapter, check_exported_parity
 from .library import board_key
 from .tables import BoardContext, build_tables, accelerate_rule
 from .workflow import analyse, completed, mark, policy_identity
@@ -42,14 +42,33 @@ def export(spec):
         started = time.perf_counter()
         context = BoardContext(game, board)
         board_adapter = accelerate_rule(context, adapter) if item["family"] == "rule" else adapter
-        checks = check_adapter(context, board_adapter, require_suit_invariance=item.get("require_suit_invariance", False))
-        tables = build_tables(context, board_adapter)
+        board_adapter, checks = checked_adapter(context, board_adapter,
+            require_suit_invariance=item.get("require_suit_invariance", False),
+            float64_fallback=item.get("sd_float64_fallback", False))
+        query_order = item.get("sd_query_order", "schema")
+        tables = build_tables(context, board_adapter, query_order=query_order)
+        if item["family"] == "sd_cfr":
+            try:
+                checks["exported_scalar_parity"] = check_exported_parity(context, board_adapter, tables)
+            except ValueError as error:
+                if (not item.get("sd_float64_fallback", False)
+                        or board_adapter.metadata.get("inference_precision") != "float32"
+                        or not str(error).startswith("Export/reference policy mismatch:")):
+                    raise
+                original_error = str(error)
+                board_adapter, checks = checked_adapter(context, board_adapter.sd_float64_copy(),
+                    require_suit_invariance=item.get("require_suit_invariance", False))
+                tables = build_tables(context, board_adapter, query_order=query_order)
+                checks["exported_scalar_parity"] = check_exported_parity(context, board_adapter, tables)
+                checks["export_precision_retry"] = dict(original_error=original_error,
+                    from_precision="float32", to_precision="float64", tolerance_unchanged=True)
         output.mkdir(parents=True, exist_ok=True)
         temporary = output / "tables.tmp.npz"
         np.savez_compressed(temporary, **tables)
         temporary.replace(output / "tables.npz")
         write_json(output / "diagnostics.json", dict(checks=checks, adapter=board_adapter.metadata,
                     stats=board_adapter.stats,
+                    query_order=query_order, native_stats=getattr(board_adapter.native, "stats", None),
                     stats_scope="this_board" if item["family"] == "rule" else "cumulative_current_attempt",
                     elapsed_seconds=time.perf_counter() - started))
         mark(output, spec["identity"], "tables.npz")

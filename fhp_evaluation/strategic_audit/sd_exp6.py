@@ -69,7 +69,8 @@ def make_spec(stage, input_root, native_root):
             family="sd_cfr", checkpoint=str(Path(input_root).resolve() / item["local"]),
             sha256=item["sha256"], repo_root=str(Path(native_root).resolve()),
             cohort=item["cohort"], training_seed=item["training_seed"], hours=item["hours"],
-            require_suit_invariance=True, batch_size=1024, model_batch_size=32)
+            require_suit_invariance=True, batch_size=1024, model_batch_size=32,
+            sd_float64_fallback=True, sd_query_order="hand_major")
     return dict(protocol=PROTOCOL, policies=policies, candidates=list(checkpoint_registry(stage)),
                 opponents=list(RULES), range_tilts=[0, -2, 2],
                 note="SD-CFR Exp6 only; full uniform archives with exact own-reach weighting. "
@@ -310,8 +311,12 @@ def main():
     parser.add_argument("--input-root", type=Path, required=True)
     parser.add_argument("--native-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--import-sd-cache", type=Path,
+                        help="Explicit continuation of the pinned stopped development audit")
     parser.add_argument("--download", action="store_true", help="Fetch only complete pinned archives from the fixed source bucket")
     args = parser.parse_args()
+    if args.import_sd_cache and args.stage != "development":
+        parser.error("The cache continuation is development-only")
     from ..best_response.runner import write_json
     from .validation import validate
     from .workflow import run
@@ -329,7 +334,7 @@ def main():
     summary_path = run(spec, library, args.output, include_reference=False,
                        resume=(args.output / "manifest.json").exists(), threads=THREADS,
                        max_seconds=execution["session_seconds"], max_rss_mb=MAX_RSS_MB,
-                       board_exports=execution)
+                       board_exports=execution, import_sd_cache=args.import_sd_cache)
     result = json.loads(summary_path.read_text())
     if result.get("status") != "succeeded" or result.get("exact_full_game_exploitability") is not False:
         raise ValueError("Missing or incompatible completed numerical audit")

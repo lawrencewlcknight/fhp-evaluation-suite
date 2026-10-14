@@ -4,11 +4,13 @@
 import argparse
 import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
 import re
 import subprocess
+import tarfile
 
 ROOT = Path(__file__).resolve().parents[1]
 RUN_PATTERN = r"fhp-sd6-audit-[a-z0-9](?:[a-z0-9-]{0,26}[a-z0-9])?"
@@ -26,10 +28,12 @@ experiment = load_module("sd_audit_config", ROOT / "fhp_evaluation/strategic_aud
 EXTRA_FILES = ("gcp/sd_exp6_strategic_audit_batch.py", "gcp/run_sd_exp6_strategic_audit.sh",
                "gcp/finalize_sd_exp6_strategic_audit.sh")
 REQUEST_FIELDS = ("run_id", "project", "region", "bucket", "service_account", "stage",
-                  "previous_run_id", "previous_reviewed")
+                  "previous_run_id", "previous_reviewed", "skip_pilot")
 
 
 def validate(args, *, preparing=False):
+    if args.skip_pilot and args.stage != "development":
+        raise ValueError("--skip-pilot is only valid for development after a reviewed profile")
     if not re.fullmatch(RUN_PATTERN, args.run_id or ""):
         raise ValueError("RUN_ID must start fhp-sd6-audit- and contain at most 41 lowercase characters")
     if not re.fullmatch(r"[a-z][a-z0-9-]{4,61}[a-z0-9]", args.project or ""):
@@ -55,7 +59,48 @@ def validate(args, *, preparing=False):
         raise ValueError("Next stage requires a distinct --previous-run-id and explicit --previous-reviewed")
 
 
-def build_job(args, bundle_hash):
+def frozen_profile(args):
+    """Reuse the profiled payload verbatim; never bundle unrelated current edits.
+
+    Prepare is still offline. Submit authenticates this exact request and bundle
+    against the successful remote profile before any upload or paid submission.
+    """
+    directory = args.profile_run_dir or ROOT / "outputs/batch" / args.previous_run_id
+    request_bytes = (directory / "request.json").read_bytes()
+    request = json.loads(request_bytes)
+    if (request.get("experiment") != experiment.EXPERIMENT or request.get("stage") != "profile" or
+            request.get("run_id") != args.previous_run_id):
+        raise ValueError("--skip-pilot requires the prepared inputs of the reviewed profile")
+    for name in ("project", "region", "bucket", "service_account"):
+        if request.get(name) != getattr(args, name):
+            raise ValueError(f"Profile and development differ: {name}")
+    bundle = (directory / "source.tar.gz").read_bytes()
+    bundle_hash = hashlib.sha256(bundle).hexdigest()
+    if (bundle_hash != request.get("bundle_sha256") or
+            bundle_hash != request.get("prepared_files_sha256", {}).get("source.tar.gz")):
+        raise ValueError("Frozen profile bundle failed its checksum")
+    source = request["source"]
+    with tarfile.open(fileobj=io.BytesIO(bundle), mode="r:gz") as archive:
+        names = archive.getnames()
+        if (len(names) != len(set(names)) or set(names) != set(source["files"]) | {"source_manifest.json"} or
+                any(not member.isfile() for member in archive.getmembers())):
+            raise ValueError("Unexpected frozen profile bundle contents")
+        for name, digest in source["files"].items():
+            if hashlib.sha256(archive.extractfile(name).read()).hexdigest() != digest:
+                raise ValueError(f"Frozen profile source checksum failed: {name}")
+        if json.loads(archive.extractfile("source_manifest.json").read()) != source:
+            raise ValueError("Frozen profile source manifest differs from its request")
+        scripts = {name: archive.extractfile("evaluator/" + name).read().decode()
+                   for name in EXTRA_FILES[1:]}
+    # The local launcher must still describe the frozen checkpoint/resource contract.
+    config = "fhp_evaluation/strategic_audit/sd_exp6.py"
+    if source["files"].get("evaluator/" + config) != common.sha256(ROOT / config):
+        raise ValueError("Audit configuration changed since profiling; review before direct development")
+    return bundle, source, scripts, hashlib.sha256(request_bytes).hexdigest()
+
+
+def build_job(args, bundle_hash, scripts=None):
+    scripts = scripts or {name: (ROOT / name).read_text() for name in EXTRA_FILES[1:]}
     duration = experiment.JOB_HOURS[args.stage] * 3600
     destination = f"{args.bucket}/{args.run_id}"
     env = dict(FHP_BUNDLE_URI=f"{destination}/inputs/source.tar.gz", FHP_BUNDLE_SHA256=bundle_hash,
@@ -65,9 +110,9 @@ def build_job(args, bundle_hash):
         computeResource=dict(cpuMilli=16000, memoryMib=56000), maxRetryCount=0,
         maxRunDuration=f"{duration}s", environment=dict(variables=env), runnables=[
             dict(displayName="sd-exp6-audit", timeout=f"{duration - 1200}s",
-                 script=dict(text=(ROOT / EXTRA_FILES[1]).read_text())),
+                 script=dict(text=scripts[EXTRA_FILES[1]])),
             dict(displayName="final-upload", alwaysRun=True, timeout="900s",
-                 script=dict(text=(ROOT / EXTRA_FILES[2]).read_text()))]))],
+                 script=dict(text=scripts[EXTRA_FILES[2]]))]))],
         allocationPolicy=dict(serviceAccount=dict(email=args.service_account), instances=[dict(policy=dict(
             machineType="n2-standard-16", provisioningModel="STANDARD",
             bootDisk=dict(sizeGb=200, type="pd-balanced")))]),
@@ -90,10 +135,15 @@ def list_jobs(args, prefix):
 def verify_previous(args, request):
     if args.stage == "profile":
         return
-    previous_stage = "profile" if args.stage == "pilot" else "pilot"
+    previous_stage = "profile" if args.stage == "pilot" or args.skip_pilot else "pilot"
     prefix = f"{args.bucket}/{args.previous_run_id}"
     success = json.loads(read("gcloud", "storage", "cat", prefix + "/analysis/SUCCESS.json"))
-    source = json.loads(read("gcloud", "storage", "cat", prefix + "/inputs/request.json"))
+    source_text = read("gcloud", "storage", "cat", prefix + "/inputs/request.json")
+    source = json.loads(source_text)
+    if args.skip_pilot and (
+            hashlib.sha256(source_text.encode()).hexdigest() != request.get("profile_request_sha256") or
+            source.get("bundle_sha256") != request.get("bundle_sha256")):
+        raise ValueError("Direct development must reuse the exact successful profile request and bundle")
     checkpoints = experiment.checkpoint_registry(previous_stage)
     if (success.get("experiment") != experiment.EXPERIMENT or success.get("status") != "succeeded" or
             success.get("stage") != previous_stage or success.get("full_archive") is not True or
@@ -155,7 +205,8 @@ def cloud_preflight(args, request, job_id, *, recovery=False):
 def verify_request(args, directory):
     request = json.loads((directory / "request.json").read_text())
     for name in REQUEST_FIELDS:
-        if request[name] != getattr(args, name):
+        value = request.get(name, False) if name == "skip_pilot" else request[name]
+        if value != getattr(args, name):
             raise ValueError(f"Arguments differ from prepared request: {name}")
     for name in ("source.tar.gz", "job.json"):
         if common.sha256(directory / name) != request["prepared_files_sha256"][name]:
@@ -176,23 +227,39 @@ def main():
     parser.add_argument("--run-dir", type=Path)
     parser.add_argument("--previous-run-id")
     parser.add_argument("--previous-reviewed", action="store_true")
+    parser.add_argument("--skip-pilot", action="store_true",
+                        help="Explicitly proceed profile -> development using the exact profiled source bundle")
+    parser.add_argument("--profile-run-dir", type=Path,
+                        help="Local prepared profile directory for --skip-pilot prepare; default outputs/batch/<previous-run-id>")
     parser.add_argument("--recovery-tag")
     args = parser.parse_args()
+    if args.profile_run_dir and (not args.skip_pilot or args.action != "prepare"):
+        parser.error("--profile-run-dir is only for prepare --skip-pilot")
     validate(args, preparing=args.action == "prepare")
     directory = (args.run_dir or ROOT / "outputs/batch" / args.run_id).resolve()
     if args.action == "prepare":
         if args.recovery_tag:
             raise ValueError("Recovery tag applies only to recover")
+        frozen = frozen_profile(args) if args.skip_pilot else None
         directory.mkdir(parents=True, exist_ok=False)
-        source = common.make_bundle(ROOT, args.native_repo, directory / "source.tar.gz",
-                                    extra_files=EXTRA_FILES, native_packages=("deep_cfr_poker",))
+        if frozen:
+            bundle, source, scripts, profile_request_hash = frozen
+            (directory / "source.tar.gz").write_bytes(bundle)
+        else:
+            source = common.make_bundle(ROOT, args.native_repo, directory / "source.tar.gz",
+                                        extra_files=EXTRA_FILES, native_packages=("deep_cfr_poker",))
+            scripts = None
         bundle_hash = common.sha256(directory / "source.tar.gz")
-        (directory / "job.json").write_text(json.dumps(build_job(args, bundle_hash), indent=2) + "\n")
+        (directory / "job.json").write_text(json.dumps(build_job(args, bundle_hash, scripts), indent=2) + "\n")
         request = {key: getattr(args, key) for key in REQUEST_FIELDS}
         request.update(experiment=experiment.EXPERIMENT, source=source, bundle_sha256=bundle_hash,
                        prepared_files_sha256={p: common.sha256(directory / p) for p in ("source.tar.gz", "job.json")})
+        if frozen:
+            request["profile_request_sha256"] = profile_request_hash
         (directory / "request.json").write_text(json.dumps(request, indent=2) + "\n")
         print(f"Prepared {args.stage} in {directory}; no cloud calls or paid jobs.")
+        if frozen:
+            print("Pilot explicitly skipped. Exact profiled source reused; parallel throughput remains unmeasured.")
         return
     request = verify_request(args, directory)
     if args.action == "recover":

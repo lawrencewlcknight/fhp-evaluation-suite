@@ -137,7 +137,7 @@ def exclusive(directory):
 
 def run(spec, library, directory, *, partition="development", include_reference=False,
         unlock_assessment=False, resume=False, threads=2, max_seconds=7200, max_rss_mb=8192,
-        board_exports=None):
+        board_exports=None, import_sd_cache=None):
     started = time.monotonic()
     if board_exports is not None:
         from .board_export import AuditDeferred, export_boards, next_attempt, validate_config
@@ -168,6 +168,9 @@ def run(spec, library, directory, *, partition="development", include_reference=
     if board_exports is not None:
         provenance["board_exports"] = board_exports
         provenance["board_export_limits"] = dict(max_rss_mb=max_rss_mb, analysis_max_seconds=max_seconds)
+    if import_sd_cache is not None:
+        from .sd_continuation import SOURCE_URI, MANIFEST_SHA256
+        provenance["cache_import"] = dict(source_uri=SOURCE_URI, manifest_sha256=MANIFEST_SHA256)
     fingerprint = digest(provenance)
     directory = Path(directory).resolve()
     with exclusive(directory):
@@ -180,6 +183,9 @@ def run(spec, library, directory, *, partition="development", include_reference=
                 raise ValueError("Cannot resume an audit without a manifest")
             write_json(manifest, provenance)
         write_json(directory / "status.json", dict(status="running", identity=fingerprint))
+        if import_sd_cache is not None:
+            from .sd_continuation import import_verified
+            import_verified(import_sd_cache, directory, provenance, fingerprint)
         if board_exports is not None:
             try:
                 export_boards(provenance, boards, directory, fingerprint, board_exports,

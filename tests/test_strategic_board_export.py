@@ -65,7 +65,8 @@ def test_parallel_unique_boards_memory_budget_resume_and_timings(tmp_path, monke
     assert peak == 4 and len(seen) == 8
     assert all(s["policy"]["family"] == "sd_cfr" for s in specs[:4])
     assert report["completed_boards"] == 8 and report["remaining_boards"] == 0
-    assert len(report["waves"]) == 2 and report["waves"][0]["boards_per_hour"] > 0
+    assert len(report["tasks"]) == 8 and report["scheduler"] == "rolling_v1"
+    assert report["waves"][0]["boards_per_hour"] > 0
     monkeypatch.setattr(b, "run_bounded", lambda *a, **k: pytest.fail("repeated a completed board"))
     report = b.export_boards(inputs(), boards, tmp_path, "f", config(),
                              deadline=time.monotonic()+100, max_rss_mb=52000, completed=w.completed)
@@ -198,3 +199,45 @@ def test_no_analysis_until_all_board_exports_complete(tmp_path, monkeypatch):
         w.run(create_spec(smoke=True), build_library(pilot=True, reference_deals=0), tmp_path,
               board_exports=config(), threads=4)
     assert json.loads((tmp_path / "status.json").read_text())["status"] == "deferred_time_budget"
+
+
+def test_rolling_refills_before_slowest_task_finishes(tmp_path, monkeypatch):
+    from pathlib import Path
+    slow_started, third_started = threading.Event(), threading.Event()
+    boards = [[0, 1, 2], [3, 4, 5], [6, 7, 8]]
+    provenance = dict(spec=dict(policies=dict(sd={"family": "sd_cfr"})),
+                      policies=dict(sd={"family": "sd_cfr"}), threads=1)
+    def run(spec, directory, **kwargs):
+        board = spec["boards"][0]
+        if board == boards[0]:
+            slow_started.set()
+            assert third_started.wait(timeout=5), "idle slot was not refilled"
+        elif board == boards[1]:
+            assert slow_started.wait(timeout=5)
+        else:
+            third_started.set()
+        cache(Path(spec["cache"]) / b.board_key(board), "f")
+        return dict(status="succeeded", elapsed_seconds=1, peak_rss_bytes=10)
+    monkeypatch.setattr(b, "run_bounded", run)
+    report = b.export_boards(provenance, boards, tmp_path, "f", config(2),
+                             deadline=time.monotonic()+100, max_rss_mb=1000, completed=w.completed)
+    assert report["completed_boards"] == 3
+
+
+def test_failed_board_does_not_prevent_other_boards_and_is_not_retried(tmp_path, monkeypatch):
+    from pathlib import Path
+    seen = []
+    def run(spec, directory, **kwargs):
+        seen.append((spec["cache"], spec["boards"]))
+        if len(seen) == 1:
+            return dict(status="failed", elapsed_seconds=1, peak_rss_bytes=10)
+        cache(Path(spec["cache"]) / b.board_key(spec["boards"][0]), "f")
+        return dict(status="succeeded", elapsed_seconds=1, peak_rss_bytes=10)
+    monkeypatch.setattr(b, "run_bounded", run)
+    with pytest.raises(RuntimeError, match="Board export failed"):
+        b.export_boards(inputs(), [[0, 1, 2], [3, 4, 5]], tmp_path, "f", config(1),
+                        deadline=time.monotonic()+100, max_rss_mb=52000, completed=w.completed)
+    report = json.loads((tmp_path / "export_progress.json").read_text())
+    assert len(seen) == 4 and report["completed_boards"] == 3
+    assert report["remaining_boards"] == 1 and len(report["failures"]) == 1
+    assert report["status"] == "failed"
